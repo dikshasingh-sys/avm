@@ -399,6 +399,7 @@ list(
   "${AVM_ROOT}/av2/common/x86/highbd_jnt_convolve_avx2.c"
   "${AVM_ROOT}/av2/common/x86/highbd_wiener_convolve_avx2.c"
   "${AVM_ROOT}/av2/common/x86/highbd_warp_affine_avx2.c"
+  "${AVM_ROOT}/av2/common/x86/intra_edge_avx2.c"
   "${AVM_ROOT}/av2/common/x86/reconinter_avx2.c")
 
 list(APPEND AVM_AV2_COMMON_INTRIN_AVX2

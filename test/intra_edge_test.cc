@@ -23,6 +23,7 @@
 #include "config/av2_rtcd.h"
 
 #include "avm/avm_integer.h"
+#include "avm_ports/avm_timer.h"
 #include "av2/common/enums.h"
 
 using libavm_test::FunctionEquivalenceTest;
@@ -34,7 +35,7 @@ class FilterEdgeTest : public FunctionEquivalenceTest<F> {
  protected:
   static const int kIterations = 1000000;
   static const int kMaxEdge = 2 * 64;
-  static const int kBufSize = kMaxEdge + 32;
+  static const int kBufSize = kMaxEdge + 64;
   static const int kOffset = 15;
 
   virtual ~FilterEdgeTest() {}
@@ -107,23 +108,58 @@ INSTANTIATE_TEST_SUITE_P(SSE4_1, FilterEdgeTestHB,
                              av2_filter_intra_edge_high_sse4_1)));
 #endif  // HAVE_SSE4_1
 
+#if HAVE_AVX2
+INSTANTIATE_TEST_SUITE_P(
+    AVX2, FilterEdgeTestHB,
+    ::testing::Values(FilterEdgeTestFuncsHBD(av2_filter_intra_edge_high_c,
+                                             av2_filter_intra_edge_high_avx2)));
+#endif  // HAVE_AVX2
+
 // Speed tests
 
 TEST_P(FilterEdgeTestHB, DISABLED_Speed) {
-  const int test_count = 10000000;
-  size_ = kMaxEdge;
-  strength_ = 1;
+  const int num_iters = 1000000;
   bit_depth_ = 12;
-  const int hi = 1 << bit_depth_;
-  for (int i = 0; i < kOffset + size_; ++i) {
-    edge_tst_data_[i] = rng_(hi);
+  const int sample_range = 1 << bit_depth_;
+  for (int i = 0; i < kOffset + kMaxEdge + 1; ++i) {
+    const uint16_t sample_val = rng_(sample_range);
+    edge_ref_data_[i] = sample_val;
+    edge_tst_data_[i] = sample_val;
   }
+  edge_ref_ = &edge_ref_data_[kOffset];
   edge_tst_ = &edge_tst_data_[kOffset];
-  for (int iter = 0; iter < test_count; ++iter) {
-    ASM_REGISTER_STATE_CHECK(params_.tst_func(edge_tst_, size_, strength_));
-    // iterate over filter strengths (1,2,3)
-    strength_ = (strength_ == 3) ? 1 : strength_ + 1;
+
+  const int kEdgeLengths[] = { 5, 9, 17, 33, 65, 129 };
+  double log_speedup_sum = 0.0;
+  for (int size_idx = 0; size_idx < 6; ++size_idx) {
+    const int edge_len = kEdgeLengths[size_idx];
+    avm_usec_timer ref_timer;
+    avm_usec_timer_start(&ref_timer);
+    int strength = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+      params_.ref_func(edge_ref_, edge_len, strength);
+      strength = (strength == 3) ? 1 : strength + 1;
+    }
+    avm_usec_timer_mark(&ref_timer);
+    const double ref_elapsed_us =
+        static_cast<double>(avm_usec_timer_elapsed(&ref_timer));
+
+    avm_usec_timer tst_timer;
+    avm_usec_timer_start(&tst_timer);
+    strength = 1;
+    for (int iter = 0; iter < num_iters; ++iter) {
+      params_.tst_func(edge_tst_, edge_len, strength);
+      strength = (strength == 3) ? 1 : strength + 1;
+    }
+    avm_usec_timer_mark(&tst_timer);
+    const double tst_elapsed_us =
+        static_cast<double>(avm_usec_timer_elapsed(&tst_timer));
+    const double speedup = ref_elapsed_us / tst_elapsed_us;
+    log_speedup_sum += log(speedup);
+    printf("FilterEdgeHB len=%3d: C=%7.1fms SIMD=%7.1fms speedup=%.2fx\n",
+           edge_len, ref_elapsed_us / 1000.0, tst_elapsed_us / 1000.0, speedup);
   }
+  printf("FilterEdgeHB geomean: %.2fx\n", exp(log_speedup_sum / 6.0));
 }
 
 }  // namespace

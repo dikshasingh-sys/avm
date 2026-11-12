@@ -90,79 +90,30 @@ foreach (@tx_sizes) {
   }
 }
 
-specialize qw/avm_highbd_v_predictor_4x4 sse2/;
-specialize qw/avm_highbd_v_predictor_4x8 sse2/;
-specialize qw/avm_highbd_v_predictor_8x4 sse2/;
-specialize qw/avm_highbd_v_predictor_8x8 sse2/;
-specialize qw/avm_highbd_v_predictor_8x16 sse2/;
-specialize qw/avm_highbd_v_predictor_16x8 sse2/;
-specialize qw/avm_highbd_v_predictor_16x16 sse2/;
-specialize qw/avm_highbd_v_predictor_16x32 sse2/;
-specialize qw/avm_highbd_v_predictor_32x16 sse2/;
-specialize qw/avm_highbd_v_predictor_32x32 sse2/;
-
 foreach (@tx_sizes) {
   ($w, $h) = @$_;
   next if ($w < 4 || $h < 4);
-  foreach $pred_name (qw/smooth smooth_v smooth_h/) {
+  foreach $pred_name (qw/smooth smooth_v smooth_h paeth ibp_dc ibp_dc_top ibp_dc_left/) {
     specialize "avm_highbd_${pred_name}_predictor_${w}x${h}", qw/avx2/;
   }
+  my $has_sse2 = ($w <= 32 && $h <= 32 && ($w == $h || $w == 2 * $h || $h == 2 * $w));
+  foreach $pred_name (qw/v h dc_left dc_top dc_128/) {
+    if ($has_sse2) {
+      specialize "avm_highbd_${pred_name}_predictor_${w}x${h}", qw/sse2 avx2/;
+    } else {
+      specialize "avm_highbd_${pred_name}_predictor_${w}x${h}", qw/avx2/;
+    }
+  }
+  if ($w == $h && $has_sse2) {
+    specialize "avm_highbd_dc_predictor_${w}x${h}", qw/sse2 avx2 neon/;
+  } elsif ($w == $h) {
+    specialize "avm_highbd_dc_predictor_${w}x${h}", qw/avx2 neon/;
+  } elsif ($has_sse2) {
+    specialize "avm_highbd_dc_predictor_${w}x${h}", qw/sse2 avx2/;
+  } else {
+    specialize "avm_highbd_dc_predictor_${w}x${h}", qw/avx2/;
+  }
 }
-
-# TODO(yunqingwang): optimize rectangular DC_PRED to replace division
-# by multiply and shift.
-specialize qw/avm_highbd_dc_predictor_4x4 sse2 neon/;
-specialize qw/avm_highbd_dc_predictor_4x8 sse2/;
-specialize qw/avm_highbd_dc_predictor_8x4 sse2/;;
-specialize qw/avm_highbd_dc_predictor_8x8 sse2 neon/;;
-specialize qw/avm_highbd_dc_predictor_8x16 sse2/;;
-specialize qw/avm_highbd_dc_predictor_16x8 sse2/;
-specialize qw/avm_highbd_dc_predictor_16x16 sse2 neon/;
-specialize qw/avm_highbd_dc_predictor_16x32 sse2/;
-specialize qw/avm_highbd_dc_predictor_32x16 sse2/;
-specialize qw/avm_highbd_dc_predictor_32x32 sse2 neon/;
-specialize qw/avm_highbd_dc_predictor_64x64 neon/;
-
-specialize qw/avm_highbd_h_predictor_4x4 sse2/;
-specialize qw/avm_highbd_h_predictor_4x8 sse2/;
-specialize qw/avm_highbd_h_predictor_8x4 sse2/;
-specialize qw/avm_highbd_h_predictor_8x8 sse2/;
-specialize qw/avm_highbd_h_predictor_8x16 sse2/;
-specialize qw/avm_highbd_h_predictor_16x8 sse2/;
-specialize qw/avm_highbd_h_predictor_16x16 sse2/;
-specialize qw/avm_highbd_h_predictor_16x32 sse2/;
-specialize qw/avm_highbd_h_predictor_32x16 sse2/;
-specialize qw/avm_highbd_h_predictor_32x32 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_4x4 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_4x4 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_4x4 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_4x8 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_4x8 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_4x8 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_8x4 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_8x4 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_8x4 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_8x8 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_8x16 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_8x8 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_8x8 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_8x16 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_8x16 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_16x8 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_16x8 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_16x8 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_16x16 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_16x16 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_16x16 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_16x32 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_16x32 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_16x32 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_32x16 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_32x16 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_32x16 sse2/;
-specialize qw/avm_highbd_dc_left_predictor_32x32 sse2/;
-specialize qw/avm_highbd_dc_top_predictor_32x32 sse2/;
-specialize qw/avm_highbd_dc_128_predictor_32x32 sse2/;
 #
 # Sub Pixel Filters
 #
