@@ -610,542 +610,261 @@ void av2_build_compound_diffwtd_mask_highbd_avx2(
   }
 }
 
-static const uint8_t refinemv_pad_left[14][16] = {
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 2, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 4, 4, 4, 4, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 5, 5, 5, 5, 5, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 6, 6, 6, 6, 6, 6, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 7, 7, 7, 7, 7, 7, 7, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 10, 11, 12, 13, 14, 15 },
-  { 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 12, 13, 14, 15 },
-  { 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 12, 13, 14, 15 },
-  { 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 13, 14, 15 },
-  { 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 14, 15 },
+// Doubled pixel indices (byte offsets) for a 16-pixel chunk of uint16_t.
+DECLARE_ALIGNED(32, static const int8_t, pixel_byte_offsets[32]) = {
+  0,  0,  2,  2,  4,  4,  6,  6,  8,  8,  10, 10, 12, 12, 14, 14,
+  16, 16, 18, 18, 20, 20, 22, 22, 24, 24, 26, 26, 28, 28, 30, 30
 };
 
-static const uint8_t refinemv_pad_left_bw_greater_than_15[16][16] = {
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 2, 2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 4, 4, 4, 4, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 5, 5, 5, 5, 5, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 6, 6, 6, 6, 6, 6, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 7, 7, 7, 7, 7, 7, 7, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 10, 11, 12, 13, 14, 15 },
-  { 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 11, 12, 13, 14, 15 },
-  { 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 12, 13, 14, 15 },
-  { 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 13, 14, 15 },
-  { 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 14, 15 },
-  { 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 15 },
-  { 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15 },
-};
+typedef enum {
+  PAD_ROW_WIDE_16PX,           // Widths 17..32: two overlapping 16-px chunks.
+  PAD_ROW_NARROW_ALIGN_LEFT,   // Widths 8..16: 16-px load from row start.
+  PAD_ROW_NARROW_ALIGN_RIGHT,  // Widths 8..16: 16-px load from row end.
+  PAD_ROW_BROADCAST_PIXEL,     // Entire row repeats one border pixel.
+  PAD_ROW_GATHER_LANES,        // >7 px padding: four independent 8-px lanes.
+  PAD_ROW_FALLBACK             // Out-of-line path (>7 px padding or <8, >32).
+} PadRowMode;
 
-static const uint8_t refinemv_pad_right_arr[16][16] = {
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 14 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 13, 13 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, 12 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 11, 11, 11, 11 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 10, 10 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9, 9, 9, 9 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8, 8, 8, 8 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
-  { 0, 1, 2, 3, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6 },
-  { 0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 },
-  { 0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 },
-  { 0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 },
-  { 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 },
-  { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
-  { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-};
+typedef struct {
+  __m256i shuffle_mask[2];
+  int right_chunk_col;     // Start column of the right 16-px or 8-px chunk.
+  int is_wide_chunk;       // 1 for 16-px chunks, 0 for 8-px chunks.
+  int lane_src_offset[4];  // Source column offset per 8-px lane.
+} PadRowConfig;
 
-static const uint8_t refinemv_pad_right_bw_31[15][16] = {
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 13, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 11, 11, 11, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 10, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9, 9, 9, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8, 8, 8, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 15 },
-  { 0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 15 },
-  { 0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 15 },
-  { 0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 15 },
-  { 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 15 },
-  { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 15 },
-  { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15 },
-};
+// Builds a pshufb mask clamping pixel indices to [min_col, max_col].
+static INLINE __m256i build_clamp_shuffle_mask(__m256i byte_offsets,
+                                               int min_col, int max_col) {
+  byte_offsets =
+      _mm256_max_epi8(byte_offsets, _mm256_set1_epi8((char)(2 * min_col)));
+  byte_offsets =
+      _mm256_min_epi8(byte_offsets, _mm256_set1_epi8((char)(2 * max_col)));
+  return _mm256_add_epi8(byte_offsets, _mm256_set1_epi16(0x0100));
+}
 
-static const uint8_t refinemv_pad_right_bw_23[8][16] = {
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 5, 5, 5, 8, 9, 10, 11, 12, 13, 13, 14 },
-  { 0, 1, 2, 3, 4, 4, 4, 4, 8, 9, 10, 11, 12, 12, 12, 13 },
-  { 0, 1, 2, 3, 3, 3, 3, 3, 8, 9, 10, 11, 11, 11, 11, 12 },
-  { 0, 1, 2, 2, 2, 2, 2, 2, 8, 9, 10, 10, 10, 10, 10, 11 },
-  { 0, 1, 1, 1, 1, 1, 1, 1, 8, 9, 9, 9, 9, 9, 9, 9 },
-  { 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8 },
-  { 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8 },
-};
+// Clamps an 8-px lane's source column so it overlaps valid reference columns.
+static INLINE int clamp_lane_src_offset(int lane_dst_col, int valid_start_col,
+                                        int valid_end_col) {
+  return clamp(lane_dst_col, valid_start_col - 7, valid_end_col);
+}
 
-static const uint8_t refinemv_pad_left_bw_23[8][16] = {
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 1, 1, 2, 3, 4, 5, 6, 5, 9, 9, 10, 11, 12, 13, 14, 14 },
-  { 2, 2, 2, 3, 4, 5, 6, 4, 10, 10, 10, 11, 12, 13, 14, 15 },
-  { 3, 3, 3, 3, 4, 5, 6, 3, 11, 11, 11, 11, 12, 13, 14, 15 },
-  { 4, 4, 4, 4, 4, 5, 6, 2, 12, 12, 12, 12, 12, 13, 14, 15 },
-  { 5, 5, 5, 5, 5, 5, 6, 1, 13, 13, 13, 13, 13, 13, 14, 15 },
-  { 6, 6, 6, 6, 6, 6, 6, 0, 14, 14, 14, 14, 14, 14, 14, 15 },
-  { 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8, 8 },
-};
+// Builds a 128-bit pshufb mask for an 8-px lane at lane_dst_col.
+static INLINE __m128i build_lane_shuffle_mask(int lane_dst_col,
+                                              int lane_src_col,
+                                              int valid_start_col,
+                                              int valid_end_col) {
+  const int col_shift = clamp(lane_dst_col - lane_src_col, -8, 8);
+  const int valid_lane_start = AVMMAX(valid_start_col - lane_src_col, 0);
+  const int valid_lane_end = AVMMIN(valid_end_col - lane_src_col, 7);
+  __m128i byte_offsets = _mm_load_si128((const __m128i *)pixel_byte_offsets);
+  byte_offsets =
+      _mm_add_epi8(byte_offsets, _mm_set1_epi8((char)(2 * col_shift)));
+  byte_offsets =
+      _mm_max_epi8(byte_offsets, _mm_set1_epi8((char)(2 * valid_lane_start)));
+  byte_offsets =
+      _mm_min_epi8(byte_offsets, _mm_set1_epi8((char)(2 * valid_lane_end)));
+  return _mm_add_epi8(byte_offsets, _mm_set1_epi16(0x0100));
+}
 
-static const uint8_t refinemv_pad_right_bw_15[14][16] = {
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 13, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, 12, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 11, 11, 11, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 10, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9, 9, 9, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 8, 8, 8, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 15 },
-  { 0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 15 },
-  { 0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 15 },
-  { 0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 15 },
-  { 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 15 },
-  { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 15 },
-};
+static AVM_FORCE_INLINE void load_padded_row(PadRowMode mode,
+                                             const uint16_t *src_row,
+                                             const PadRowConfig *cfg,
+                                             __m256i *left_chunk,
+                                             __m256i *right_chunk) {
+  if (mode == PAD_ROW_WIDE_16PX) {
+    *left_chunk =
+        _mm256_shuffle_epi8(yy_loadu_256(src_row), cfg->shuffle_mask[0]);
+    *right_chunk = _mm256_shuffle_epi8(
+        yy_loadu_256(src_row + cfg->right_chunk_col), cfg->shuffle_mask[1]);
+  } else if (mode == PAD_ROW_NARROW_ALIGN_LEFT) {
+    *left_chunk = *right_chunk =
+        _mm256_shuffle_epi8(yy_loadu_256(src_row), cfg->shuffle_mask[0]);
+  } else if (mode == PAD_ROW_NARROW_ALIGN_RIGHT) {
+    *left_chunk = *right_chunk = _mm256_shuffle_epi8(
+        yy_loadu_256(src_row + cfg->right_chunk_col - 8), cfg->shuffle_mask[0]);
+  } else if (mode == PAD_ROW_BROADCAST_PIXEL) {
+    *left_chunk = *right_chunk = _mm256_set1_epi16(*src_row);
+  } else {
+    *left_chunk =
+        _mm256_shuffle_epi8(yy_loadu2_128(src_row + cfg->lane_src_offset[1],
+                                          src_row + cfg->lane_src_offset[0]),
+                            cfg->shuffle_mask[0]);
+    *right_chunk =
+        _mm256_shuffle_epi8(yy_loadu2_128(src_row + cfg->lane_src_offset[3],
+                                          src_row + cfg->lane_src_offset[2]),
+                            cfg->shuffle_mask[1]);
+  }
+}
 
-static const uint8_t refinemv_pad_right_bw_11[10][16] = {
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 5, 6, 6, 6, 6, 6, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 11, 12, 13, 14, 15 },
-  { 0, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 11, 12, 13, 14, 15 },
-  { 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 11, 12, 13, 14, 15 },
-};
+static AVM_FORCE_INLINE void store_padded_row(PadRowMode mode,
+                                              uint16_t *dst_row,
+                                              const PadRowConfig *cfg,
+                                              __m256i left_chunk,
+                                              __m256i right_chunk) {
+  // Store the padded lane first so the valid lane overwrites shared columns.
+  if (mode == PAD_ROW_NARROW_ALIGN_LEFT) {
+    xx_storeu_128(dst_row + cfg->right_chunk_col,
+                  _mm256_extracti128_si256(left_chunk, 1));
+    xx_storeu_128(dst_row, _mm256_castsi256_si128(left_chunk));
+  } else if (mode == PAD_ROW_NARROW_ALIGN_RIGHT) {
+    xx_storeu_128(dst_row, _mm256_castsi256_si128(left_chunk));
+    xx_storeu_128(dst_row + cfg->right_chunk_col,
+                  _mm256_extracti128_si256(left_chunk, 1));
+  } else if (mode == PAD_ROW_WIDE_16PX || cfg->is_wide_chunk) {
+    yy_storeu_256(dst_row, left_chunk);
+    yy_storeu_256(dst_row + cfg->right_chunk_col, right_chunk);
+  } else {
+    xx_storeu_128(dst_row, _mm256_castsi256_si128(left_chunk));
+    xx_storeu_128(dst_row + cfg->right_chunk_col,
+                  _mm256_castsi256_si128(right_chunk));
+  }
+}
 
-DECLARE_ALIGNED(32, static const uint8_t, pad_mc_border_shuffle_pattern[32]) = {
-  0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15,
-  0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15
-};
+static AVM_FORCE_INLINE void pad_block_rows(
+    PadRowMode mode, const uint16_t *src_row, ptrdiff_t src_stride,
+    uint16_t *dst_row, ptrdiff_t dst_stride, const PadRowConfig *cfg,
+    int block_h, int cur_ref_row, int last_ref_row) {
+  __m256i left_chunk, right_chunk;
+  if (cur_ref_row >= last_ref_row || cur_ref_row + block_h <= 1) {
+    // Entire block clamps to a single top or bottom boundary row.
+    load_padded_row(mode, src_row, cfg, &left_chunk, &right_chunk);
+    do {
+      store_padded_row(mode, dst_row, cfg, left_chunk, right_chunk);
+      dst_row += dst_stride;
+    } while (--block_h);
+    return;
+  }
+  do {
+    load_padded_row(mode, src_row, cfg, &left_chunk, &right_chunk);
+    store_padded_row(mode, dst_row, cfg, left_chunk, right_chunk);
+    // Advance src_row only inside [0, last_ref_row].
+    src_row +=
+        (unsigned int)cur_ref_row < (unsigned int)last_ref_row ? src_stride : 0;
+    ++cur_ref_row;
+    dst_row += dst_stride;
+  } while (--block_h);
+}
 
-DECLARE_ALIGNED(32, static const uint8_t, pad_mc_border_arrange_bytes[32]) = {
-  0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15,
-  0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15
-};
+#if defined(_MSC_VER)
+#define PAD_MC_BORDER_NOINLINE __declspec(noinline)
+#else
+#define PAD_MC_BORDER_NOINLINE __attribute__((noinline))
+#endif
 
-// AVX2 implementation for refinemv_highbd_pad_mc_border_c for b_w = 15.
-void refinemv_highbd_pad_mc_border_avx2(const uint16_t *src, int src_stride,
-                                        uint16_t *dst, int dst_stride, int x0,
-                                        int y0, int b_w, int b_h,
-                                        const ReferenceArea *ref_area) {
-  if (b_w != 15 && b_w != 11 && b_w != 23 && b_w != 31) {
+// Handles >7 px horizontal padding or widths outside [8, 32].
+static PAD_MC_BORDER_NOINLINE void pad_mc_border_fallback(
+    const uint16_t *src, int src_stride, uint16_t *dst, int dst_stride, int x0,
+    int y0, int b_w, int b_h, const ReferenceArea *ref_area) {
+  if (b_w < 8 || b_w > 32) {
     refinemv_highbd_pad_mc_border_c(src, src_stride, dst, dst_stride, x0, y0,
                                     b_w, b_h, ref_area);
     return;
   }
+  const int valid_start_col = ref_area->pad_block.x0 - x0;
+  const int valid_end_col = ref_area->pad_block.x1 - 1 - x0;
+  const int cur_ref_row = y0 - ref_area->pad_block.y0;
+  const int last_ref_row = ref_area->pad_block.y1 - ref_area->pad_block.y0 - 1;
+  const int clamped_start_row = clamp(cur_ref_row, 0, last_ref_row);
+  const uint16_t *src_row =
+      src + (ptrdiff_t)(clamped_start_row - cur_ref_row) * src_stride;
+  PadRowConfig cfg;
+  cfg.is_wide_chunk = b_w >= 16;
+  cfg.right_chunk_col = b_w - (cfg.is_wide_chunk ? 16 : 8);
+  if (valid_start_col >= b_w - 1 || valid_end_col <= 0) {
+    const int border_col = valid_end_col <= 0 ? valid_end_col : valid_start_col;
+    pad_block_rows(PAD_ROW_BROADCAST_PIXEL, src_row + border_col, src_stride,
+                   dst, dst_stride, &cfg, b_h, cur_ref_row, last_ref_row);
+    return;
+  }
+  const int lane1_col = cfg.is_wide_chunk ? 8 : 0;
+  const int lane2_col = cfg.right_chunk_col;
+  const int lane3_col = cfg.right_chunk_col + lane1_col;
+  cfg.lane_src_offset[0] =
+      clamp_lane_src_offset(0, valid_start_col, valid_end_col);
+  cfg.lane_src_offset[1] =
+      clamp_lane_src_offset(lane1_col, valid_start_col, valid_end_col);
+  cfg.lane_src_offset[2] =
+      clamp_lane_src_offset(lane2_col, valid_start_col, valid_end_col);
+  cfg.lane_src_offset[3] =
+      clamp_lane_src_offset(lane3_col, valid_start_col, valid_end_col);
+  cfg.shuffle_mask[0] =
+      yy_set_m128i(build_lane_shuffle_mask(lane1_col, cfg.lane_src_offset[1],
+                                           valid_start_col, valid_end_col),
+                   build_lane_shuffle_mask(0, cfg.lane_src_offset[0],
+                                           valid_start_col, valid_end_col));
+  cfg.shuffle_mask[1] =
+      yy_set_m128i(build_lane_shuffle_mask(lane3_col, cfg.lane_src_offset[3],
+                                           valid_start_col, valid_end_col),
+                   build_lane_shuffle_mask(lane2_col, cfg.lane_src_offset[2],
+                                           valid_start_col, valid_end_col));
+  pad_block_rows(PAD_ROW_GATHER_LANES, src_row, src_stride, dst, dst_stride,
+                 &cfg, b_h, cur_ref_row, last_ref_row);
+}
 
-  assert(b_w == 15 || b_w == 11 || b_w == 23 || b_w == 31);
-  const int ref_x0 = ref_area->pad_block.x0;
-  const int ref_y0 = ref_area->pad_block.y0;
-  const int ref_x1 = ref_area->pad_block.x1;
-  const int ref_y1 = ref_area->pad_block.y1;
+// Picks a single-pshufb fast path when each 8-px lane has >= 1 valid pixel.
+static INLINE PadRowMode select_pad_row_mode(int b_w, int valid_start_col,
+                                             int valid_end_col) {
+  if (b_w > 16) {
+    if (b_w <= 32 && valid_start_col <= 7 && valid_end_col >= b_w - 8)
+      return PAD_ROW_WIDE_16PX;
+  } else if (b_w >= 8) {
+    if (valid_start_col <= 7 && valid_end_col >= 8)
+      return PAD_ROW_NARROW_ALIGN_LEFT;
+    if (valid_start_col <= b_w - 9 && valid_end_col >= b_w - 8)
+      return PAD_ROW_NARROW_ALIGN_RIGHT;
+  }
+  return PAD_ROW_FALLBACK;
+}
 
-  // Get a pointer to the start of the real data for this row.
-  const uint16_t *ref_row = src - x0 - y0 * src_stride;
-
-  if (y0 >= ref_area->pad_block.y1)
-    ref_row += (ref_area->pad_block.y1 - 1) * src_stride;
-  else if (y0 >= ref_area->pad_block.y0)
-    ref_row += y0 * src_stride;
-  else
-    ref_row += ref_area->pad_block.y0 * src_stride;
-
-  int left = x0 < ref_x0 ? ref_x0 - x0 : 0;
-  if (left > b_w) left = b_w;
-  int right = (x0 + b_w > ref_x1) ? (x0 + b_w - ref_x1) : 0;
-  if (right > b_w) right = b_w;
-  if (b_w == 23) {
-    if (left < (b_w - 1) && right < (b_w - 1) && (left != 0 || right != 0)) {
-      const __m256i shuffle_input_reg =
-          _mm256_load_si256((__m256i *)pad_mc_border_arrange_bytes);
-      const __m256i shuffle_output_reg =
-          _mm256_load_si256((__m256i *)pad_mc_border_shuffle_pattern);
-      if (left < 16) {
-        const __m128i shuffle_left = _mm_loadu_si128(
-            (__m128i *)refinemv_pad_left_bw_greater_than_15[left]);
-        const __m256i shuffle_reg_left = _mm256_inserti128_si256(
-            _mm256_castsi128_si256(shuffle_left), shuffle_left, 1);
-        if (right > 6) {
-          const uint8_t *refinemv_pad_right = refinemv_pad_right_arr[right - 7];
-          const __m128i shuffle_right =
-              _mm_loadu_si128((__m128i *)refinemv_pad_right);
-          const __m256i shuffle_reg_right = _mm256_inserti128_si256(
-              _mm256_castsi128_si256(shuffle_right), shuffle_right, 1);
-          __m256i out_reg_lo;
-          __m128i out_reg_hi;
-          do {
-            // s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15
-            const __m256i src_lo =
-                _mm256_loadu_si256((__m256i *)(ref_row + x0));
-
-            const __m256i src_01 =
-                _mm256_shuffle_epi8(src_lo, shuffle_input_reg);
-            __m256i src_reg = _mm256_permute4x64_epi64(src_01, 0xD8);
-
-            src_reg = _mm256_shuffle_epi8(src_reg, shuffle_reg_left);
-            src_reg = _mm256_shuffle_epi8(src_reg, shuffle_reg_right);
-
-            out_reg_lo = _mm256_shuffle_epi8(
-                _mm256_permute4x64_epi64(src_reg, 0xD8), shuffle_output_reg);
-            out_reg_hi = _mm_set1_epi16(ref_row[b_w + x0 - right - 1]);
-            do {
-              _mm256_storeu_si256((__m256i *)dst, out_reg_lo);
-              _mm_storeu_si128((__m128i *)(dst + 16), out_reg_hi);
-              dst += dst_stride;
-              ++y0;
-              --b_h;
-            } while ((y0 <= ref_y0 || y0 >= ref_y1) && b_h);
-            ref_row += src_stride;
-          } while (b_h);
-        } else {
-          const uint8_t *refinemv_pad_right = refinemv_pad_right_bw_23[right];
-          const __m128i shuffle_right =
-              _mm_loadu_si128((__m128i *)refinemv_pad_right);
-          __m256i out_reg_lo;
-          __m128i out_reg_hi;
-          do {
-            // s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15
-            const __m256i src_lo =
-                _mm256_loadu_si256((__m256i *)(ref_row + x0));
-            // s17 s18 s19 s20 s21 s22 x x
-            const __m128i src_hi =
-                _mm_loadu_si128((__m128i *)(ref_row + x0 + 16));
-
-            const __m256i src_01 =
-                _mm256_shuffle_epi8(src_lo, shuffle_input_reg);
-            __m128i src_01_hi = _mm_shuffle_epi8(
-                src_hi, _mm256_castsi256_si128(shuffle_input_reg));
-            __m256i src_reg = _mm256_permute4x64_epi64(src_01, 0xD8);
-
-            src_reg = _mm256_shuffle_epi8(src_reg, shuffle_reg_left);
-            src_01_hi = _mm_shuffle_epi8(src_01_hi, shuffle_right);
-
-            out_reg_lo = _mm256_shuffle_epi8(
-                _mm256_permute4x64_epi64(src_reg, 0xD8), shuffle_output_reg);
-            out_reg_hi = _mm_shuffle_epi8(
-                src_01_hi, _mm256_castsi256_si128(shuffle_output_reg));
-            do {
-              _mm256_storeu_si256((__m256i *)dst, out_reg_lo);
-              _mm_storeu_si128((__m128i *)(dst + 16), out_reg_hi);
-              dst += dst_stride;
-              ++y0;
-              --b_h;
-            } while ((y0 <= ref_y0 || y0 >= ref_y1) && b_h);
-            ref_row += src_stride;
-          } while (b_h);
-        }
-      } else {
-        if (right > 6) {
-          const uint8_t *refinemv_pad_right = refinemv_pad_right_arr[right - 7];
-          const __m128i shuffle_right =
-              _mm_loadu_si128((__m128i *)refinemv_pad_right);
-          const __m256i shuffle_reg_right = _mm256_inserti128_si256(
-              _mm256_castsi128_si256(shuffle_right), shuffle_right, 1);
-          __m256i out_reg_lo;
-          __m128i out_reg_hi;
-          do {
-            // s0
-            const __m256i src_lo = _mm256_set1_epi16(ref_row[x0 + left]);
-
-            const __m256i src_01 =
-                _mm256_shuffle_epi8(src_lo, shuffle_input_reg);
-            __m256i src_reg = _mm256_permute4x64_epi64(src_01, 0xD8);
-            src_reg = _mm256_shuffle_epi8(src_reg, shuffle_reg_right);
-
-            out_reg_lo = _mm256_shuffle_epi8(
-                _mm256_permute4x64_epi64(src_reg, 0xD8), shuffle_output_reg);
-            out_reg_hi = _mm_set1_epi16(ref_row[b_w + x0 - right - 1]);
-            do {
-              _mm256_storeu_si256((__m256i *)dst, out_reg_lo);
-              _mm_storeu_si128((__m128i *)(dst + 16), out_reg_hi);
-              dst += dst_stride;
-              ++y0;
-              --b_h;
-            } while ((y0 <= ref_y0 || y0 >= ref_y1) && b_h);
-            ref_row += src_stride;
-          } while (b_h);
-        } else {
-          const uint8_t *refinemv_pad_right = refinemv_pad_right_bw_23[right];
-          const __m128i shuffle_right =
-              _mm_loadu_si128((__m128i *)refinemv_pad_right);
-          const __m128i shuffle_left =
-              _mm_loadu_si128((__m128i *)refinemv_pad_left_bw_23[left - 16]);
-          __m256i out_reg_lo;
-          __m128i out_reg_hi;
-          do {
-            // s0
-            const __m256i src_lo = _mm256_set1_epi16(ref_row[x0 + left]);
-            // s17 s18 s19 s20 s21 s22 x x
-            const __m128i src_hi =
-                _mm_loadu_si128((__m128i *)(ref_row + x0 + 16));
-
-            __m128i src_01_hi = _mm_shuffle_epi8(
-                src_hi, _mm256_castsi256_si128(shuffle_input_reg));
-            src_01_hi = _mm_shuffle_epi8(src_01_hi, shuffle_left);
-            src_01_hi = _mm_shuffle_epi8(src_01_hi, shuffle_right);
-
-            out_reg_lo = src_lo;
-            out_reg_hi = _mm_shuffle_epi8(
-                src_01_hi, _mm256_castsi256_si128(shuffle_output_reg));
-            do {
-              _mm256_storeu_si256((__m256i *)dst, out_reg_lo);
-              _mm_storeu_si128((__m128i *)(dst + 16), out_reg_hi);
-              dst += dst_stride;
-              ++y0;
-              --b_h;
-            } while ((y0 <= ref_y0 || y0 >= ref_y1) && b_h);
-            ref_row += src_stride;
-          } while (b_h);
-        }
-      }
-    } else if (left == 0 && right == 0) {
-      do {
-        const __m256i src_lo = _mm256_loadu_si256((__m256i *)(ref_row + x0));
-        const __m128i src_hi = _mm_loadu_si128((__m128i *)(ref_row + x0 + 16));
-        _mm256_storeu_si256((__m256i *)dst, src_lo);
-        _mm_storeu_si128((__m128i *)(dst + 16), src_hi);
-        dst += dst_stride;
-        ++y0;
-        if (y0 > ref_y0 && y0 < ref_y1) ref_row += src_stride;
-      } while (--b_h);
-    } else {
-      const uint16_t *cur_ref_row =
-          (left >= (b_w - 1)) ? (ref_row + ref_x0) : (ref_row + ref_x1 - 1);
-      do {
-        const __m256i src_0 = _mm256_set1_epi16(cur_ref_row[0]);
-        _mm256_storeu_si256((__m256i *)dst, src_0);
-        _mm_storeu_si128((__m128i *)(dst + 16), _mm256_castsi256_si128(src_0));
-        dst += dst_stride;
-        ++y0;
-        if (y0 > ref_y0 && y0 < ref_y1) cur_ref_row += src_stride;
-      } while (--b_h);
-    }
-  } else if (b_w == 31) {
-    if (left < (b_w - 1) && right < (b_w - 1) && (left != 0 || right != 0)) {
-      const __m256i shuffle_input_reg =
-          _mm256_load_si256((__m256i *)pad_mc_border_arrange_bytes);
-      const __m256i shuffle_output_reg =
-          _mm256_load_si256((__m256i *)pad_mc_border_shuffle_pattern);
-      if (left < 16) {
-        if (right > 14) {
-          const uint8_t *refine_mv_pad_right =
-              refinemv_pad_right_arr[right - 15];
-          const uint8_t *refine_mv_pad_left =
-              refinemv_pad_left_bw_greater_than_15[left];
-          const __m128i shuffle_right =
-              _mm_loadu_si128((__m128i *)refine_mv_pad_right);
-          const __m256i shuffle_reg_right = _mm256_inserti128_si256(
-              _mm256_castsi128_si256(shuffle_right), shuffle_right, 1);
-          const __m128i shuffle_left =
-              _mm_loadu_si128((__m128i *)refine_mv_pad_left);
-          const __m256i shuffle_reg_left = _mm256_inserti128_si256(
-              _mm256_castsi128_si256(shuffle_left), shuffle_left, 1);
-          __m256i out_reg_lo, out_reg_hi;
-          do {
-            // s0
-            const __m256i src_lo =
-                _mm256_loadu_si256((__m256i *)(ref_row + x0));
-
-            const __m256i src_01 =
-                _mm256_shuffle_epi8(src_lo, shuffle_input_reg);
-            __m256i src_reg = _mm256_permute4x64_epi64(src_01, 0xD8);
-            src_reg = _mm256_shuffle_epi8(src_reg, shuffle_reg_left);
-            src_reg = _mm256_shuffle_epi8(src_reg, shuffle_reg_right);
-
-            out_reg_lo = _mm256_shuffle_epi8(
-                _mm256_permute4x64_epi64(src_reg, 0xD8), shuffle_output_reg);
-            out_reg_hi = _mm256_set1_epi16(ref_row[b_w + x0 - right - 1]);
-            do {
-              _mm256_storeu_si256((__m256i *)dst, out_reg_lo);
-              _mm256_storeu_si256((__m256i *)(dst + 16), out_reg_hi);
-              dst += dst_stride;
-              ++y0;
-              --b_h;
-            } while ((y0 <= ref_y0 || y0 >= ref_y1) && b_h);
-            ref_row += src_stride;
-          } while (b_h);
-        } else {
-          const uint8_t *refinemv_pad_right = refinemv_pad_right_bw_31[right];
-          const uint8_t *refine_mv_pad_left =
-              refinemv_pad_left_bw_greater_than_15[left];
-          const __m128i shuffle_right =
-              _mm_loadu_si128((__m128i *)refinemv_pad_right);
-          const __m256i shuffle_reg_right = _mm256_inserti128_si256(
-              _mm256_castsi128_si256(shuffle_right), shuffle_right, 1);
-          const __m128i shuffle_left =
-              _mm_loadu_si128((__m128i *)refine_mv_pad_left);
-          const __m256i shuffle_reg_left = _mm256_inserti128_si256(
-              _mm256_castsi128_si256(shuffle_left), shuffle_left, 1);
-          __m256i out_reg_lo, out_reg_hi;
-          do {
-            // s0
-            const __m256i src_lo =
-                _mm256_loadu_si256((__m256i *)(ref_row + x0));
-            const __m256i src_hi =
-                _mm256_loadu_si256((__m256i *)(ref_row + x0 + 16));
-
-            const __m256i src_01 =
-                _mm256_shuffle_epi8(src_lo, shuffle_input_reg);
-            const __m256i src_02 =
-                _mm256_shuffle_epi8(src_hi, shuffle_input_reg);
-            __m256i src_reg_lo = _mm256_permute4x64_epi64(src_01, 0xD8);
-            __m256i src_reg_hi = _mm256_permute4x64_epi64(src_02, 0xD8);
-            src_reg_lo = _mm256_shuffle_epi8(src_reg_lo, shuffle_reg_left);
-            src_reg_hi = _mm256_shuffle_epi8(src_reg_hi, shuffle_reg_right);
-
-            out_reg_lo = _mm256_shuffle_epi8(
-                _mm256_permute4x64_epi64(src_reg_lo, 0xD8), shuffle_output_reg);
-            out_reg_hi = _mm256_shuffle_epi8(
-                _mm256_permute4x64_epi64(src_reg_hi, 0xD8), shuffle_output_reg);
-            do {
-              _mm256_storeu_si256((__m256i *)dst, out_reg_lo);
-              _mm256_storeu_si256((__m256i *)(dst + 16), out_reg_hi);
-              dst += dst_stride;
-              ++y0;
-              --b_h;
-            } while ((y0 <= ref_y0 || y0 >= ref_y1) && b_h);
-            ref_row += src_stride;
-          } while (b_h);
-        }
-      } else {
-        assert(right < 14);
-        const uint8_t *refinemv_pad_right = refinemv_pad_right_bw_31[right];
-        const uint8_t *refine_mv_pad_left =
-            refinemv_pad_left_bw_greater_than_15[left - 16];
-        const __m128i shuffle_right =
-            _mm_loadu_si128((__m128i *)refinemv_pad_right);
-        const __m256i shuffle_reg_right = _mm256_inserti128_si256(
-            _mm256_castsi128_si256(shuffle_right), shuffle_right, 1);
-        const __m128i shuffle_left =
-            _mm_loadu_si128((__m128i *)refine_mv_pad_left);
-        const __m256i shuffle_reg_left = _mm256_inserti128_si256(
-            _mm256_castsi128_si256(shuffle_left), shuffle_left, 1);
-        __m256i out_reg_lo, out_reg_hi;
-        do {
-          out_reg_lo = _mm256_set1_epi16(ref_row[x0 + left]);
-          const __m256i src_hi =
-              _mm256_loadu_si256((__m256i *)(ref_row + x0 + 16));
-
-          const __m256i src_02 = _mm256_shuffle_epi8(src_hi, shuffle_input_reg);
-          __m256i src_reg_hi = _mm256_permute4x64_epi64(src_02, 0xD8);
-          src_reg_hi = _mm256_shuffle_epi8(src_reg_hi, shuffle_reg_left);
-          src_reg_hi = _mm256_shuffle_epi8(src_reg_hi, shuffle_reg_right);
-
-          out_reg_hi = _mm256_shuffle_epi8(
-              _mm256_permute4x64_epi64(src_reg_hi, 0xD8), shuffle_output_reg);
-          do {
-            _mm256_storeu_si256((__m256i *)dst, out_reg_lo);
-            _mm256_storeu_si256((__m256i *)(dst + 16), out_reg_hi);
-            dst += dst_stride;
-            ++y0;
-            --b_h;
-          } while ((y0 <= ref_y0 || y0 >= ref_y1) && b_h);
-          ref_row += src_stride;
-        } while (b_h);
-      }
-    } else if (left == 0 && right == 0) {
-      do {
-        const __m256i src_lo = _mm256_loadu_si256((__m256i *)(ref_row + x0));
-        const __m256i src_hi =
-            _mm256_loadu_si256((__m256i *)(ref_row + x0 + 16));
-        _mm256_storeu_si256((__m256i *)dst, src_lo);
-        _mm256_storeu_si256((__m256i *)(dst + 16), src_hi);
-        dst += dst_stride;
-        ++y0;
-        if (y0 > ref_y0 && y0 < ref_y1) ref_row += src_stride;
-      } while (--b_h);
-    } else {
-      const uint16_t *cur_ref_row =
-          (left >= (b_w - 1)) ? (ref_row + ref_x0) : (ref_row + ref_x1 - 1);
-      do {
-        const __m256i src_0 = _mm256_set1_epi16(cur_ref_row[0]);
-        _mm256_storeu_si256((__m256i *)dst, src_0);
-        _mm256_storeu_si256((__m256i *)(dst + 16), src_0);
-        dst += dst_stride;
-        ++y0;
-        if (y0 > ref_y0 && y0 < ref_y1) cur_ref_row += src_stride;
-      } while (--b_h);
-    }
+void refinemv_highbd_pad_mc_border_avx2(const uint16_t *src, int src_stride,
+                                        uint16_t *dst, int dst_stride, int x0,
+                                        int y0, int b_w, int b_h,
+                                        const ReferenceArea *ref_area) {
+  const int valid_start_col = ref_area->pad_block.x0 - x0;
+  const int valid_end_col = ref_area->pad_block.x1 - 1 - x0;
+  const PadRowMode mode =
+      select_pad_row_mode(b_w, valid_start_col, valid_end_col);
+  if (mode == PAD_ROW_FALLBACK) {
+    pad_mc_border_fallback(src, src_stride, dst, dst_stride, x0, y0, b_w, b_h,
+                           ref_area);
+    return;
+  }
+  const int cur_ref_row = y0 - ref_area->pad_block.y0;
+  const int last_ref_row = ref_area->pad_block.y1 - ref_area->pad_block.y0 - 1;
+  const int clamped_start_row = clamp(cur_ref_row, 0, last_ref_row);
+  const uint16_t *src_row =
+      src + (ptrdiff_t)(clamped_start_row - cur_ref_row) * src_stride;
+  const int copy_start_col = AVMMAX(valid_start_col, 0);
+  const int copy_end_col = AVMMIN(valid_end_col, b_w - 1);
+  PadRowConfig cfg;
+  cfg.is_wide_chunk = mode == PAD_ROW_WIDE_16PX;
+  if (mode == PAD_ROW_WIDE_16PX) {
+    const __m256i byte_offsets =
+        _mm256_load_si256((const __m256i *)pixel_byte_offsets);
+    cfg.right_chunk_col = b_w - 16;
+    cfg.shuffle_mask[0] =
+        build_clamp_shuffle_mask(byte_offsets, copy_start_col, copy_end_col);
+    cfg.shuffle_mask[1] = build_clamp_shuffle_mask(
+        byte_offsets, copy_start_col - cfg.right_chunk_col,
+        copy_end_col - cfg.right_chunk_col);
+    pad_block_rows(PAD_ROW_WIDE_16PX, src_row, src_stride, dst, dst_stride,
+                   &cfg, b_h, cur_ref_row, last_ref_row);
+    return;
+  }
+  cfg.right_chunk_col = b_w - 8;
+  cfg.shuffle_mask[0] = build_clamp_shuffle_mask(
+      yy_loadu2_128(pixel_byte_offsets + 2 * cfg.right_chunk_col,
+                    pixel_byte_offsets),
+      copy_start_col, copy_end_col);
+  if (mode == PAD_ROW_NARROW_ALIGN_LEFT) {
+    pad_block_rows(PAD_ROW_NARROW_ALIGN_LEFT, src_row, src_stride, dst,
+                   dst_stride, &cfg, b_h, cur_ref_row, last_ref_row);
   } else {
-    if (left < (b_w - 1) && right < (b_w - 1) && (left != 0 || right != 0)) {
-      const __m128i shuffle_left =
-          _mm_loadu_si128((__m128i *)refinemv_pad_left[left]);
-      const __m256i shuffle_reg_left = _mm256_inserti128_si256(
-          _mm256_castsi128_si256(shuffle_left), shuffle_left, 1);
-
-      const uint8_t *refinemv_pad_right = b_w == 15
-                                              ? refinemv_pad_right_bw_15[right]
-                                              : refinemv_pad_right_bw_11[right];
-
-      const __m128i shuffle_right =
-          _mm_loadu_si128((__m128i *)refinemv_pad_right);
-      const __m256i shuffle_reg_right = _mm256_inserti128_si256(
-          _mm256_castsi128_si256(shuffle_right), shuffle_right, 1);
-
-      const __m256i shuffle_input_reg =
-          _mm256_load_si256((__m256i *)pad_mc_border_arrange_bytes);
-      const __m256i shuffle_output_reg =
-          _mm256_load_si256((__m256i *)pad_mc_border_shuffle_pattern);
-      __m256i out_reg;
-      do {
-        const __m256i src_0 = _mm256_loadu_si256((__m256i *)(ref_row + x0));
-
-        const __m256i src_01 = _mm256_shuffle_epi8(src_0, shuffle_input_reg);
-        __m256i src_reg = _mm256_permute4x64_epi64(src_01, 0xD8);
-
-        src_reg = _mm256_shuffle_epi8(src_reg, shuffle_reg_left);
-        src_reg = _mm256_shuffle_epi8(src_reg, shuffle_reg_right);
-
-        out_reg = _mm256_shuffle_epi8(_mm256_permute4x64_epi64(src_reg, 0xD8),
-                                      shuffle_output_reg);
-        do {
-          _mm256_storeu_si256((__m256i *)dst, out_reg);
-          dst += dst_stride;
-          ++y0;
-          --b_h;
-        } while ((y0 <= ref_y0 || y0 >= ref_y1) && b_h);
-        ref_row += src_stride;
-      } while (b_h);
-    } else if (left == 0 && right == 0) {
-      do {
-        const __m256i src_0 = _mm256_loadu_si256((__m256i *)(ref_row + x0));
-        _mm256_storeu_si256((__m256i *)dst, src_0);
-        dst += dst_stride;
-        ++y0;
-        if (y0 > ref_y0 && y0 < ref_y1) ref_row += src_stride;
-      } while (--b_h);
-    } else {
-      const uint16_t *cur_ref_row =
-          (left >= (b_w - 1)) ? (ref_row + ref_x0) : (ref_row + ref_x1 - 1);
-      do {
-        const __m256i src_0 = _mm256_set1_epi16(cur_ref_row[0]);
-        _mm256_storeu_si256((__m256i *)dst, src_0);
-        dst += dst_stride;
-        ++y0;
-        if (y0 > ref_y0 && y0 < ref_y1) cur_ref_row += src_stride;
-      } while (--b_h);
-    }
+    // Offset mask because the load starts (8 - right_chunk_col) px before x0.
+    cfg.shuffle_mask[0] = _mm256_add_epi8(
+        cfg.shuffle_mask[0],
+        _mm256_set1_epi8((char)(2 * (8 - cfg.right_chunk_col))));
+    pad_block_rows(PAD_ROW_NARROW_ALIGN_RIGHT, src_row, src_stride, dst,
+                   dst_stride, &cfg, b_h, cur_ref_row, last_ref_row);
   }
 }

@@ -224,7 +224,7 @@ class RefinemvPadMCBorderTest : public ::testing::TestWithParam<Params> {
 
     ACMRandom rnd;
     rnd.Reset(ACMRandom::DeterministicSeed());
-    for (int j = 0; j < (int)max_block_size; ++j) {
+    for (int j = 0; j < kMaxDimension * kMaxDimension; ++j) {
       src_[j] = rnd.Rand16() & mask;
     }
   }
@@ -362,7 +362,17 @@ const Params kRefinemvPadMCBorder_avx2[] = {
   make_tuple(4, 4, 10, &refinemv_highbd_pad_mc_border_avx2),
   make_tuple(4, 8, 10, &refinemv_highbd_pad_mc_border_avx2),
   make_tuple(4, 4, 12, &refinemv_highbd_pad_mc_border_avx2),
-  make_tuple(4, 8, 12, &refinemv_highbd_pad_mc_border_avx2)
+  make_tuple(4, 8, 12, &refinemv_highbd_pad_mc_border_avx2),
+  // Additional block widths and single-axis padded sizes.
+  make_tuple(1, 8, 10, &refinemv_highbd_pad_mc_border_avx2),
+  make_tuple(9, 16, 10, &refinemv_highbd_pad_mc_border_avx2),
+  make_tuple(17, 24, 10, &refinemv_highbd_pad_mc_border_avx2),
+  make_tuple(8, 1, 10, &refinemv_highbd_pad_mc_border_avx2),
+  make_tuple(16, 9, 10, &refinemv_highbd_pad_mc_border_avx2),
+  make_tuple(24, 17, 10, &refinemv_highbd_pad_mc_border_avx2),
+  make_tuple(5, 4, 10, &refinemv_highbd_pad_mc_border_avx2),
+  make_tuple(13, 13, 10, &refinemv_highbd_pad_mc_border_avx2),
+  make_tuple(20, 8, 10, &refinemv_highbd_pad_mc_border_avx2)
 };
 
 INSTANTIATE_TEST_SUITE_P(AVX2, RefinemvPadMCBorderTest,
