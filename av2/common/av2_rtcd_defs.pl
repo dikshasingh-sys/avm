@@ -463,7 +463,7 @@ specialize qw/av2_highbd_convolve_2d_scale sse4_1/;
 
 # INTRA_EDGE functions
 add_proto qw/void av2_filter_intra_edge_high/, "uint16_t *p, int sz, int strength";
-specialize qw/av2_filter_intra_edge_high sse4_1/;
+specialize qw/av2_filter_intra_edge_high sse4_1 avx2/;
 
 # CFL
 add_proto qw/void mhccp_predict_hv_hbd/, "const uint16_t *input, uint16_t *dst, bool have_top, bool have_left, int dst_stride, int *alpha_q3, int bit_depth, int width, int height, int dir";

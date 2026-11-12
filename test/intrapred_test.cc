@@ -106,46 +106,29 @@ class AV2IntraPredTest
     dst_ = dst;
     ref_dst_ = ref_dst;
     int error_count = 0;
-    const int numIter = 100;
+    const int numIter = (1 << 24) / (block_width * block_height);
 
-    int c_sum_time = 0;
-    int simd_sum_time = 0;
-    for (int i = 0; i < count_test_block; ++i) {
-      // Fill edges with random data, try first with saturated values.
-      for (int x = -1; x <= block_width * 2; x++) {
-        if (i == 0) {
-          above_row_[x] = mask_;
-        } else {
-          above_row_[x] = rnd.Rand16() & mask_;
-        }
-      }
-      for (int y = 0; y < block_height; y++) {
-        if (i == 0) {
-          left_col_[y] = mask_;
-        } else {
-          left_col_[y] = rnd.Rand16() & mask_;
-        }
-      }
-
-      avm_usec_timer c_timer_;
-      avm_usec_timer_start(&c_timer_);
-
-      PredictRefSpeedTest(numIter);
-
-      avm_usec_timer_mark(&c_timer_);
-
-      avm_usec_timer simd_timer_;
-      avm_usec_timer_start(&simd_timer_);
-
-      PredictFncSpeedTest(numIter);
-
-      avm_usec_timer_mark(&simd_timer_);
-
-      c_sum_time += static_cast<int>(avm_usec_timer_elapsed(&c_timer_));
-      simd_sum_time += static_cast<int>(avm_usec_timer_elapsed(&simd_timer_));
-
-      CheckPrediction(i, &error_count);
+    for (int x = -1; x <= block_width * 2; x++) {
+      above_row_[x] = rnd.Rand16() & mask_;
     }
+    for (int y = 0; y <= block_height * 2; y++) {
+      left_col_[y] = rnd.Rand16() & mask_;
+    }
+
+    avm_usec_timer c_timer_;
+    avm_usec_timer_start(&c_timer_);
+    PredictRefSpeedTest(numIter);
+    avm_usec_timer_mark(&c_timer_);
+
+    avm_usec_timer simd_timer_;
+    avm_usec_timer_start(&simd_timer_);
+    PredictFncSpeedTest(numIter);
+    avm_usec_timer_mark(&simd_timer_);
+
+    const int c_sum_time = static_cast<int>(avm_usec_timer_elapsed(&c_timer_));
+    const int simd_sum_time =
+        static_cast<int>(avm_usec_timer_elapsed(&simd_timer_));
+    CheckPrediction(0, &error_count);
 
     printf(
         "blockWxH = %d x %d c_time = %d \t simd_time = %d \t Gain = %4.2f \n",
@@ -230,7 +213,7 @@ TEST_P(HighbdIntraPredTest, Bitexact) {
 
 TEST_P(HighbdIntraPredTest, DISABLED_Speed) {
   // max block size is 64
-  DECLARE_ALIGNED(16, uint16_t, left_col[2 * 64]);
+  DECLARE_ALIGNED(16, uint16_t, left_col[2 * 64 + 1]);
   DECLARE_ALIGNED(16, uint16_t, above_data[2 * 64 + 64]);
   DECLARE_ALIGNED(16, uint16_t, dst[3 * 64 * 64]);
   DECLARE_ALIGNED(16, uint16_t, ref_dst[3 * 64 * 64]);
@@ -409,6 +392,99 @@ TEST_P(HighbdIbpDrPredTest, DISABLED_Speed) {
   }
 }
 
+class HighbdIbpDcPredTest
+    : public ::testing::TestWithParam<IntraPredFunc<HighbdIntraPred> > {
+ protected:
+  void RunBitexactTest() {
+    const IntraPredFunc<HighbdIntraPred> params = GetParam();
+    const int block_w = params.block_width;
+    const int block_h = params.block_height;
+    const int bit_depth = params.bit_depth;
+    const ptrdiff_t stride = block_w * 3;
+    const uint16_t sample_mask = (1 << bit_depth) - 1;
+    DECLARE_ALIGNED(16, uint16_t, left_col[2 * 64 + 1]);
+    DECLARE_ALIGNED(16, uint16_t, above_data[2 * 64 + 64]);
+    DECLARE_ALIGNED(16, uint16_t, dst[3 * 64 * 64]);
+    DECLARE_ALIGNED(16, uint16_t, ref_dst[3 * 64 * 64]);
+    uint16_t *above_row = above_data + 16;
+    ACMRandom rnd(ACMRandom::DeterministicSeed());
+    const int dst_buf_len = static_cast<int>(stride * block_h);
+
+    for (int iter = 0; iter < 500; ++iter) {
+      for (int x = -1; x <= block_w * 2; ++x) {
+        above_row[x] = (iter == 0) ? sample_mask : (rnd.Rand16() & sample_mask);
+      }
+      for (int y = 0; y <= block_h * 2; ++y) {
+        left_col[y] = (iter == 0) ? sample_mask : (rnd.Rand16() & sample_mask);
+      }
+      for (int idx = 0; idx < dst_buf_len; ++idx) {
+        const uint16_t init_pixel =
+            (iter == 0) ? sample_mask : (rnd.Rand16() & sample_mask);
+        dst[idx] = init_pixel;
+        ref_dst[idx] = init_pixel;
+      }
+      params.ref_fn(ref_dst, stride, above_row, left_col, bit_depth);
+      ASM_REGISTER_STATE_CHECK(
+          params.pred_fn(dst, stride, above_row, left_col, bit_depth));
+      for (int idx = 0; idx < dst_buf_len; ++idx) {
+        ASSERT_EQ(ref_dst[idx], dst[idx])
+            << block_w << "x" << block_h << " bd=" << bit_depth
+            << " iter=" << iter << " idx=" << idx;
+      }
+    }
+  }
+
+  void RunSpeedTest() {
+    const IntraPredFunc<HighbdIntraPred> params = GetParam();
+    const int block_w = params.block_width;
+    const int block_h = params.block_height;
+    const int bit_depth = params.bit_depth;
+    const ptrdiff_t stride = block_w * 3;
+    const uint16_t sample_mask = (1 << bit_depth) - 1;
+    DECLARE_ALIGNED(16, uint16_t, left_col[2 * 64 + 1]);
+    DECLARE_ALIGNED(16, uint16_t, above_data[2 * 64 + 64]);
+    DECLARE_ALIGNED(16, uint16_t, dst[3 * 64 * 64]);
+    DECLARE_ALIGNED(16, uint16_t, ref_dst[3 * 64 * 64]);
+    uint16_t *above_row = above_data + 16;
+    ACMRandom rnd(ACMRandom::DeterministicSeed());
+    const int dst_buf_len = static_cast<int>(stride * block_h);
+    for (int x = -1; x <= block_w * 2; ++x) {
+      above_row[x] = rnd.Rand16() & sample_mask;
+    }
+    for (int y = 0; y <= block_h * 2; ++y) {
+      left_col[y] = rnd.Rand16() & sample_mask;
+    }
+    for (int idx = 0; idx < dst_buf_len; ++idx) {
+      dst[idx] = ref_dst[idx] = rnd.Rand16() & sample_mask;
+    }
+
+    const int num_iters = (1 << 24) / (block_w * block_h);
+    avm_usec_timer c_timer;
+    avm_usec_timer_start(&c_timer);
+    for (int iter = 0; iter < num_iters; ++iter) {
+      params.ref_fn(ref_dst, stride, above_row, left_col, bit_depth);
+    }
+    avm_usec_timer_mark(&c_timer);
+
+    avm_usec_timer simd_timer;
+    avm_usec_timer_start(&simd_timer);
+    for (int iter = 0; iter < num_iters; ++iter) {
+      params.pred_fn(dst, stride, above_row, left_col, bit_depth);
+    }
+    avm_usec_timer_mark(&simd_timer);
+
+    const int c_time = static_cast<int>(avm_usec_timer_elapsed(&c_timer));
+    const int simd_time = static_cast<int>(avm_usec_timer_elapsed(&simd_timer));
+    printf("blockWxH = %d x %d c_time = %d \t simd_time = %d \t Gain = %4.2f\n",
+           block_w, block_h, c_time, simd_time,
+           static_cast<float>(c_time) / static_cast<float>(simd_time));
+  }
+};
+GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(HighbdIbpDcPredTest);
+
+TEST_P(HighbdIbpDcPredTest, Bitexact) { RunBitexactTest(); }
+TEST_P(HighbdIbpDcPredTest, DISABLED_Speed) { RunSpeedTest(); }
+
 #if HAVE_AVX2
 const IntraPredFunc<HighbdIntraPred> HighbdIntraPredTestVectorAvx2[] = {
   highbd_intrapred_4_to_64(smooth, avx2, 8),
@@ -420,10 +496,46 @@ const IntraPredFunc<HighbdIntraPred> HighbdIntraPredTestVectorAvx2[] = {
   highbd_intrapred_4_to_64(smooth_h, avx2, 8),
   highbd_intrapred_4_to_64(smooth_h, avx2, 10),
   highbd_intrapred_4_to_64(smooth_h, avx2, 12),
+  highbd_intrapred_4_to_64(paeth, avx2, 8),
+  highbd_intrapred_4_to_64(paeth, avx2, 10),
+  highbd_intrapred_4_to_64(paeth, avx2, 12),
+  highbd_intrapred_4_to_64(v, avx2, 8),
+  highbd_intrapred_4_to_64(v, avx2, 10),
+  highbd_intrapred_4_to_64(v, avx2, 12),
+  highbd_intrapred_4_to_64(h, avx2, 8),
+  highbd_intrapred_4_to_64(h, avx2, 10),
+  highbd_intrapred_4_to_64(h, avx2, 12),
+  highbd_intrapred_4_to_64(dc, avx2, 8),
+  highbd_intrapred_4_to_64(dc, avx2, 10),
+  highbd_intrapred_4_to_64(dc, avx2, 12),
+  highbd_intrapred_4_to_64(dc_top, avx2, 8),
+  highbd_intrapred_4_to_64(dc_top, avx2, 10),
+  highbd_intrapred_4_to_64(dc_top, avx2, 12),
+  highbd_intrapred_4_to_64(dc_left, avx2, 8),
+  highbd_intrapred_4_to_64(dc_left, avx2, 10),
+  highbd_intrapred_4_to_64(dc_left, avx2, 12),
+  highbd_intrapred_4_to_64(dc_128, avx2, 8),
+  highbd_intrapred_4_to_64(dc_128, avx2, 10),
+  highbd_intrapred_4_to_64(dc_128, avx2, 12),
 };
 
 INSTANTIATE_TEST_SUITE_P(AVX2, HighbdIntraPredTest,
                          ::testing::ValuesIn(HighbdIntraPredTestVectorAvx2));
+
+const IntraPredFunc<HighbdIntraPred> HighbdIbpDcPredTestVectorAvx2[] = {
+  highbd_intrapred_4_to_64(ibp_dc, avx2, 8),
+  highbd_intrapred_4_to_64(ibp_dc, avx2, 10),
+  highbd_intrapred_4_to_64(ibp_dc, avx2, 12),
+  highbd_intrapred_4_to_64(ibp_dc_top, avx2, 8),
+  highbd_intrapred_4_to_64(ibp_dc_top, avx2, 10),
+  highbd_intrapred_4_to_64(ibp_dc_top, avx2, 12),
+  highbd_intrapred_4_to_64(ibp_dc_left, avx2, 8),
+  highbd_intrapred_4_to_64(ibp_dc_left, avx2, 10),
+  highbd_intrapred_4_to_64(ibp_dc_left, avx2, 12),
+};
+
+INSTANTIATE_TEST_SUITE_P(AVX2, HighbdIbpDcPredTest,
+                         ::testing::ValuesIn(HighbdIbpDcPredTestVectorAvx2));
 
 INSTANTIATE_TEST_SUITE_P(
     AVX2, HighbdIbpDrPredTest,
