@@ -21,11 +21,13 @@ static INLINE void update_qp(__m256i *qp) {
   qp[0] = _mm256_permute2x128_si256(qp[0], qp[0], 0x11);
   qp[1] = _mm256_permute2x128_si256(qp[1], qp[1], 0x11);
   qp[2] = _mm256_permute2x128_si256(qp[2], qp[2], 0x11);
+  qp[3] = _mm256_permute2x128_si256(qp[3], qp[3], 0x11);
+  qp[4] = _mm256_permute2x128_si256(qp[4], qp[4], 0x11);
 }
 
 static INLINE void init_qp(const int32_t *round_ptr, const int32_t *quant_ptr,
                            const int32_t *dequant_ptr, int log_scale,
-                           __m256i *qp) {
+                           int use_tcq_deadzone_boost, __m256i *qp) {
   qp[0] = _mm256_loadu_si256((const __m256i *)round_ptr);
   qp[1] = _mm256_loadu_si256((const __m256i *)quant_ptr);
   qp[2] = _mm256_loadu_si256((const __m256i *)dequant_ptr);
@@ -35,6 +37,11 @@ static INLINE void init_qp(const int32_t *round_ptr, const int32_t *quant_ptr,
     qp[0] = _mm256_add_epi32(qp[0], rnd);
     qp[0] = _mm256_srai_epi32(qp[0], log_scale);
   }
+  qp[3] = (use_tcq_deadzone_boost == 1)
+              ? _mm256_add_epi32(_mm256_slli_epi32(qp[2], 3),
+                                 _mm256_add_epi32(qp[2], qp[2]))
+              : qp[2];
+  qp[4] = _mm256_srli_epi64(qp[1], 32);
 }
 
 // Get the max eob from the lower 128 bits.
@@ -62,10 +69,12 @@ static AVM_FORCE_INLINE __m256i get_max_lane_eob(const int16_t *iscan_ptr,
   return _mm256_max_epi16(eobmax, nz_iscan);
 }
 
-static INLINE void quantize(const __m256i *qp, const tran_low_t *coeff_ptr,
-                            const int16_t *iscan_ptr, int log_scale,
-                            tran_low_t *qcoeff, tran_low_t *dqcoeff,
-                            __m256i *eob, int use_tcq_deadzone_boost) {
+static AVM_FORCE_INLINE void quantize(const __m256i *qp,
+                                      const tran_low_t *coeff_ptr,
+                                      const int16_t *iscan_ptr, int log_scale,
+                                      tran_low_t *qcoeff, tran_low_t *dqcoeff,
+                                      __m256i *eob,
+                                      int use_tcq_deadzone_boost) {
   const __m256i coeff = _mm256_loadu_si256((const __m256i *)coeff_ptr);
   const __m256i abs_coeff = _mm256_abs_epi32(coeff);
   const __m256i abs_s =
@@ -73,18 +82,15 @@ static INLINE void quantize(const __m256i *qp, const tran_low_t *coeff_ptr,
   __m256i mask;
   if (use_tcq_deadzone_boost == 1) {
     const __m256i abs_s9 = _mm256_add_epi32(_mm256_slli_epi32(abs_s, 3), abs_s);
-    const __m256i dq10 = _mm256_add_epi32(_mm256_slli_epi32(qp[2], 3),
-                                          _mm256_add_epi32(qp[2], qp[2]));
-    mask = _mm256_cmpgt_epi32(dq10, abs_s9);
+    mask = _mm256_cmpgt_epi32(qp[3], abs_s9);
   } else {
-    mask = _mm256_cmpgt_epi32(qp[2], abs_s);
+    mask = _mm256_cmpgt_epi32(qp[3], abs_s);
   }
-  const __m256i zbin_mask = _mm256_xor_si256(mask, _mm256_set1_epi32(-1));
 
   // If all the transformed coefficient values are less than the dequantized
   // value then reset both qcoeff and dqcoeff and skip further computations of
   // quantization and dequantization.
-  if (LIKELY(_mm256_movemask_epi8(zbin_mask) == 0)) {
+  if (LIKELY(_mm256_movemask_epi8(mask) == -1)) {
     const __m256i zero = _mm256_setzero_si256();
     _mm256_storeu_si256((__m256i *)qcoeff, zero);
     _mm256_storeu_si256((__m256i *)dqcoeff, zero);
@@ -94,8 +100,7 @@ static INLINE void quantize(const __m256i *qp, const tran_low_t *coeff_ptr,
   __m256i q = _mm256_add_epi32(abs_coeff, qp[0]);
   __m256i q_lo = _mm256_mul_epi32(q, qp[1]);
   __m256i q_hi = _mm256_srli_epi64(q, 32);
-  const __m256i qp_hi = _mm256_srli_epi64(qp[1], 32);
-  q_hi = _mm256_mul_epi32(q_hi, qp_hi);
+  q_hi = _mm256_mul_epi32(q_hi, qp[4]);
   q_lo = _mm256_srli_epi64(q_lo, 16 - log_scale + QUANT_FP_BITS);
   q_hi = _mm256_slli_epi64(q_hi, 32 - (16 - log_scale + QUANT_FP_BITS));
   q = _mm256_blend_epi32(q_lo, q_hi, 0xAA);
@@ -125,30 +130,46 @@ void av2_highbd_quantize_fp_avx2(
   (void)zbin_ptr;
   (void)quant_shift_ptr;
   const unsigned int step = 8;
-  __m256i qp[3];
+  __m256i qp[5];
 
-  init_qp(round_ptr, quant_ptr, dequant_ptr, log_scale, qp);
+  init_qp(round_ptr, quant_ptr, dequant_ptr, log_scale, use_tcq_deadzone_boost,
+          qp);
 
   __m256i eob = _mm256_setzero_si256();
-  quantize(qp, coeff_ptr, iscan, log_scale, qcoeff_ptr, dqcoeff_ptr, &eob,
-           use_tcq_deadzone_boost);
-
-  coeff_ptr += step;
-  qcoeff_ptr += step;
-  dqcoeff_ptr += step;
-  iscan += step;
-  n_coeffs -= step;
-
-  update_qp(qp);
-  while (n_coeffs > 0) {
-    quantize(qp, coeff_ptr, iscan, log_scale, qcoeff_ptr, dqcoeff_ptr, &eob,
-             use_tcq_deadzone_boost);
-
+  if (use_tcq_deadzone_boost == 1) {
+    quantize(qp, coeff_ptr, iscan, log_scale, qcoeff_ptr, dqcoeff_ptr, &eob, 1);
     coeff_ptr += step;
     qcoeff_ptr += step;
     dqcoeff_ptr += step;
     iscan += step;
     n_coeffs -= step;
+    update_qp(qp);
+    while (n_coeffs > 0) {
+      quantize(qp, coeff_ptr, iscan, log_scale, qcoeff_ptr, dqcoeff_ptr, &eob,
+               1);
+      coeff_ptr += step;
+      qcoeff_ptr += step;
+      dqcoeff_ptr += step;
+      iscan += step;
+      n_coeffs -= step;
+    }
+  } else {
+    quantize(qp, coeff_ptr, iscan, log_scale, qcoeff_ptr, dqcoeff_ptr, &eob, 0);
+    coeff_ptr += step;
+    qcoeff_ptr += step;
+    dqcoeff_ptr += step;
+    iscan += step;
+    n_coeffs -= step;
+    update_qp(qp);
+    while (n_coeffs > 0) {
+      quantize(qp, coeff_ptr, iscan, log_scale, qcoeff_ptr, dqcoeff_ptr, &eob,
+               0);
+      coeff_ptr += step;
+      qcoeff_ptr += step;
+      dqcoeff_ptr += step;
+      iscan += step;
+      n_coeffs -= step;
+    }
   }
   *eob_ptr = get_max_eob(eob);
 }

@@ -72,13 +72,35 @@ uint64_t av2_tx_cache_hash_sse4_2(const int16_t *residual, int stride, int tx_w,
   assert((tx_w & 3) == 0);
   uint32_t crc_lo = 0xFFFFFFFFu;
   uint32_t crc_hi = 0x9E3779B9u;
-  for (int r = 0; r < tx_h; ++r) {
-    const int16_t *row = residual + (size_t)r * stride;
-    for (int c = 0; c < tx_w; c += 4) {
-      uint64_t v;
-      memcpy(&v, &row[c], sizeof(v));
-      crc_lo = crc32c_u64_sse42(crc_lo, v);
-      crc_hi = crc32c_u64_sse42(crc_hi, v ^ 0xA5A5A5A5A5A5A5A5ULL);
+#ifdef __x86_64__
+  if ((tx_w & 7) == 0) {
+    const __m128i xor_mask = _mm_set1_epi64x((int64_t)0xA5A5A5A5A5A5A5A5ULL);
+    for (int r = 0; r < tx_h; ++r) {
+      const int16_t *row = residual + (size_t)r * stride;
+      for (int c = 0; c < tx_w; c += 8) {
+        const __m128i v01 = _mm_loadu_si128((const __m128i *)&row[c]);
+        const __m128i x01 = _mm_xor_si128(v01, xor_mask);
+        crc_lo =
+            (uint32_t)_mm_crc32_u64(crc_lo, (uint64_t)_mm_cvtsi128_si64(v01));
+        crc_hi =
+            (uint32_t)_mm_crc32_u64(crc_hi, (uint64_t)_mm_cvtsi128_si64(x01));
+        crc_lo = (uint32_t)_mm_crc32_u64(crc_lo,
+                                         (uint64_t)_mm_extract_epi64(v01, 1));
+        crc_hi = (uint32_t)_mm_crc32_u64(crc_hi,
+                                         (uint64_t)_mm_extract_epi64(x01, 1));
+      }
+    }
+  } else
+#endif
+  {
+    for (int r = 0; r < tx_h; ++r) {
+      const int16_t *row = residual + (size_t)r * stride;
+      for (int c = 0; c < tx_w; c += 4) {
+        uint64_t v;
+        memcpy(&v, &row[c], sizeof(v));
+        crc_lo = crc32c_u64_sse42(crc_lo, v);
+        crc_hi = crc32c_u64_sse42(crc_hi, v ^ 0xA5A5A5A5A5A5A5A5ULL);
+      }
     }
   }
   const uint64_t meta0 = ((uint64_t)qindex << 32) |

@@ -644,11 +644,10 @@ void av2_update_nbr_diagonal_c(struct tcq_ctx_t *tcq_ctx, int row, int col,
   }
 }
 
-// Process the first position
-void trellis_first_pos(const tcq_param_t *p, int scan_pos, tcq_ctx_t *tcq_ctx,
-                       tcq_node_t *trellis) {
+// Process the first position directly into decision[0..TCQ_MAX_STATES-1]
+void av2_trellis_first_pos_node(const tcq_param_t *p, int scan_pos,
+                                tcq_ctx_t *tcq_ctx, tcq_node_t *decision) {
   int plane = p->plane;
-  TX_SIZE tx_size = p->tx_size;
   TX_CLASS tx_class = p->tx_class;
   int log_scale = p->log_scale;
   int64_t rdmult = p->rdmult;
@@ -662,11 +661,10 @@ void trellis_first_pos(const tcq_param_t *p, int scan_pos, tcq_ctx_t *tcq_ctx,
   const qm_val_t *iqmatrix = p->iqmatrix;
   const uint16_t *block_eob_rate = p->block_eob_rate;
   const LV_MAP_COEFF_COST *txb_costs = p->txb_costs;
-  const int bwl = get_txb_bwl(tx_size);
-  const int height = get_txb_high(tx_size);
+  const int bwl = p->bwl;
+  const int height = p->txb_height;
 
   int blk_pos = scan[scan_pos];
-  tcq_node_t *decision = &trellis[scan_pos << TCQ_N_STATES_LOG];
 
   prequant_t pqData;
   int tempdqv = get_dqv(dequant, scan[scan_pos], iqmatrix);
@@ -721,6 +719,12 @@ void trellis_first_pos(const tcq_param_t *p, int scan_pos, tcq_ctx_t *tcq_ctx,
       av2_update_nbr_diagonal(tcq_ctx, row, col, bwl);
     }
   }
+}
+
+void trellis_first_pos(const tcq_param_t *p, int scan_pos, tcq_ctx_t *tcq_ctx,
+                       tcq_node_t *trellis) {
+  av2_trellis_first_pos_node(p, scan_pos, tcq_ctx,
+                             &trellis[scan_pos << TCQ_N_STATES_LOG]);
 }
 
 void av2_get_rate_dist_lf_luma_q1_c(const struct tcq_param_t *p,
@@ -1284,13 +1288,51 @@ int av2_trellis_quant(const struct AV2_COMP *cpi, MACROBLOCK *x, int plane,
       x->rdmult, plane_rd_mult[is_inter][plane_type], xd->bd, rshift);
 
   int si = eob - 1;
-  // populate trellis
   assert(si < MAX_TRELLIS);
-  tcq_node_t trellis[MAX_TRELLIS * TCQ_MAX_STATES];
+  assert(plane == 0 && tx_class == TX_CLASS_2D &&
+         "Expected 2D luma block for TCQ");
 
-  // Precalc block eob rate.
   uint16_t block_eob_rate[MAX_TRELLIS];
-  av2_calc_block_eob_rate(x, plane, tx_size, eob, block_eob_rate);
+  if (eob == 1) {
+    const int eob_multi_size = txsize_log2_minus4[tx_size];
+    block_eob_rate[0] =
+        (uint16_t)coeff_costs->eob_costs[eob_multi_size][plane_type]
+            .eob_cost[is_inter][0];
+  } else {
+    av2_calc_block_eob_rate(x, plane, tx_size, eob, block_eob_rate);
+  }
+
+#if HAVE_AVX2
+  if (iqmatrix == NULL && (rdmult >> 32) == 0 &&
+      av2_trellis_loop_diagonal_st8 == av2_trellis_loop_diagonal_st8_avx2) {
+    tcq_param_t param;
+    param.plane = plane;
+    param.bwl = bwl;
+    param.txb_height = height;
+    param.tx_size = tx_size;
+    param.tx_class = tx_class;
+    param.sharpness = sharpness;
+    param.rdmult = rdmult;
+    param.log_scale = av2_get_tx_scale(tx_size) + 1;
+    param.dc_sign_ctx = txb_ctx->dc_sign_ctx;
+    param.scan = scan;
+    param.tmp_sign = xd->tmp_sign;
+    param.qcoeff = qcoeff;
+    param.tcoeff = tcoeff;
+    param.quant = quant;
+    param.dequant = dequant;
+    param.iqmatrix = NULL;
+    param.block_eob_rate = block_eob_rate;
+    param.txb_costs = txb_costs;
+    return av2_trellis_quant_luma_avx2(
+        &param, x, block, si, is_inter, is_fsc, bob_code,
+        cm->features.reduced_tx_set_used, tx_type, txb_ctx->txb_skip_ctx,
+        qcoeff, dqcoeff, rate_cost);
+  }
+#endif
+
+  // populate trellis
+  tcq_node_t trellis[MAX_TRELLIS * TCQ_MAX_STATES];
 
   // Collect TCQ related parameters.
   tcq_param_t param;

@@ -59,6 +59,9 @@ typedef struct {
   __m256i dist_even;
   __m256i gol_even, gol_odd;    // golomb rate of the even / odd level
   __m256i info_even, info_odd;  // absLevel << 32
+  int low_idx;
+  int mid_idx;
+  int has_gol;
 } TcqFullPos;
 
 // Number of scan positions prepared at once. It is at least MAX_DIAG, so a
@@ -170,18 +173,15 @@ DECLARE_ALIGNED(32, static const int32_t, kFullPerm[4][2][8]) = {
 static AVM_FORCE_INLINE void tcq_prepare_full(const tcq_param_t *p,
                                               int scan_pos, int blk_pos,
                                               const int lf, const int qidx,
-                                              TcqFullPos *pos) {
+                                              __m256i dq_shift,
+                                              __m256i sh_shift, __m256i v_dqv,
+                                              __m256i rdmult, TcqFullPos *pos) {
   const LV_MAP_COEFF_COST *tc = p->txb_costs;
   const int log_scale = p->log_scale;
-  const __m256i dq_shift = _mm256_set1_epi64x(QUANT_TABLE_BITS + log_scale);
-  // Shift only the low 32 bits of each lane, like av2_pre_quant_c().
-  const __m256i sh_shift = _mm256_set1_epi64x(log_scale - 1);
   const int abs_tc = abs(p->tcoeff[blk_pos]);
-  const int dqv = get_dqv(p->dequant, blk_pos, p->iqmatrix);
   const int32_t abs_sh = abs_tc * (1 << (log_scale - 1));
   // Zero-extended so that the compiler emits single vpmul[u]dq.
   const __m256i v_abs_sh = _mm256_set1_epi64x((uint32_t)abs_sh);
-  const __m256i v_dqv = _mm256_set1_epi64x((uint32_t)dqv);
   const __m256i dist0 = _mm256_mul_epi32(v_abs_sh, v_abs_sh);
   const __m256i qc = _mm256_add_epi64(_mm256_set1_epi64x(qidx),
                                       _mm256_setr_epi64x(0, 1, 2, 3));
@@ -190,9 +190,9 @@ static AVM_FORCE_INLINE void tcq_prepare_full(const tcq_param_t *p,
   const __m256i lev = _mm256_slli_epi64(
       _mm256_srli_epi64(_mm256_add_epi64(qc, _mm256_set1_epi64x(1)), 1), 32);
   const __m256i perm_even =
-      _mm256_loadu_si256((const __m256i *)kFullPerm[qidx & 3][0]);
+      _mm256_load_si256((const __m256i *)kFullPerm[qidx & 3][0]);
   const __m256i perm_odd =
-      _mm256_loadu_si256((const __m256i *)kFullPerm[qidx & 3][1]);
+      _mm256_load_si256((const __m256i *)kFullPerm[qidx & 3][1]);
   pos->dist_even = _mm256_permutevar8x32_epi32(dist, perm_even);
   pos->dist_odd = _mm256_permutevar8x32_epi32(dist, perm_odd);
   pos->info_even = _mm256_permutevar8x32_epi32(lev, perm_even);
@@ -202,23 +202,28 @@ static AVM_FORCE_INLINE void tcq_prepare_full(const tcq_param_t *p,
   // and state 4 with the Q0 odd level (lane 1).
   int mid_idx;
   const int idx = tcq_range_idx(lf, qidx, &mid_idx);
+  pos->low_idx = idx;
+  pos->mid_idx = mid_idx;
+  pos->has_gol = 0;
   const int eob_ctx = get_lower_levels_ctx_eob(p->bwl, p->txb_height, scan_pos);
   const uint16_t *eob_tbl = lf ? tc->base_lf_eob_cost_tbl[idx][eob_ctx]
                                : tc->base_eob_cost_tbl[idx][eob_ctx];
   __m128i rate_eob = _mm_add_epi32(
       _mm_cvtepu16_epi32(_mm_cvtsi32_si128((int)loadu_uint32(eob_tbl))),
       _mm_set1_epi32(p->block_eob_rate[scan_pos]));
-  __m256i gol = _mm256_setzero_si256();
   if (mid_idx >= 0) {
-    const uint16_t *mid_eob = lf ? tc->mid_lf_cost_tbl[mid_idx][7][0]
+    const int mid_eob_ctx = (lf && blk_pos != 0) ? 7 : 0;
+    const uint16_t *mid_eob = lf ? tc->mid_lf_cost_tbl[mid_idx][mid_eob_ctx][0]
                                  : tc->mid_cost_tbl[mid_idx][0][0];
     rate_eob = _mm_add_epi32(
         rate_eob,
         _mm_cvtepu16_epi32(_mm_cvtsi32_si128((int)loadu_uint32(mid_eob))));
     const int gol_start = kTcqRange[lf].gol_start;
     if (qidx >= gol_start) {
+      pos->has_gol = 1;
       // Golomb (high range) bits of the 4 level candidates.
       const int gol_idx = qidx - gol_start + 1;
+      __m256i gol;
       if (gol_idx <= 248) {
         gol = _mm256_slli_epi64(
             _mm256_cvtepu8_epi64(_mm_cvtsi32_si128(
@@ -230,20 +235,27 @@ static AVM_FORCE_INLINE void tcq_prepare_full(const tcq_param_t *p,
                                  get_golomb_cost_tcq((qidx + 3) >> 1, lf),
                                  get_golomb_cost_tcq((qidx + 4) >> 1, lf));
       }
+      pos->gol_even = _mm256_permutevar8x32_epi32(gol, perm_even);
+      pos->gol_odd = _mm256_permutevar8x32_epi32(gol, perm_odd);
     }
   }
-  pos->gol_even = _mm256_permutevar8x32_epi32(gol, perm_even);
-  pos->gol_odd = _mm256_permutevar8x32_epi32(gol, perm_odd);
   if (p->sharpness == 0) {
-    // { gol_even[0], gol_odd[0] } of the eob candidates.
-    const __m128i gol_eob =
-        _mm_unpacklo_epi32(_mm256_castsi256_si128(pos->gol_even),
-                           _mm256_castsi256_si128(pos->gol_odd));
-    rate_eob = _mm_add_epi32(rate_eob, gol_eob);
+    if (pos->has_gol) {
+      const __m128i gol_eob =
+          _mm_unpacklo_epi32(_mm256_castsi256_si128(pos->gol_even),
+                             _mm256_castsi256_si128(pos->gol_odd));
+      rate_eob = _mm_add_epi32(rate_eob, gol_eob);
+    }
+    if (blk_pos == 0) {
+      const int dc_sign = p->tcoeff[0] < 0;
+      const int dc_add =
+          tc->dc_sign_cost[0][p->dc_sign_ctx][dc_sign] - av2_cost_literal(1);
+      rate_eob = _mm_add_epi32(rate_eob, _mm_set1_epi32(dc_add));
+    }
     const __m256i rate = _mm256_cvtepu32_epi64(rate_eob);
-    const __m256i rd = _mm256_add_epi64(
-        tcq_rate_cost(rate, _mm256_set1_epi64x((uint32_t)p->rdmult)),
-        _mm256_unpacklo_epi64(pos->dist_even, pos->dist_odd));
+    const __m256i rd =
+        _mm256_add_epi64(tcq_rate_cost(rate, rdmult),
+                         _mm256_unpacklo_epi64(pos->dist_even, pos->dist_odd));
     pos->eob_rd = _mm256_blend_epi32(_mm256_set1_epi64x(INT64_MAX), rd, 0x0F);
     pos->eob_info = _mm256_or_si256(
         _mm256_or_si256(_mm256_unpacklo_epi64(pos->info_even, pos->info_odd),
@@ -251,6 +263,7 @@ static AVM_FORCE_INLINE void tcq_prepare_full(const tcq_param_t *p,
         _mm256_set1_epi64x(TCQ_NEW_EOB_PREV_ID));
   } else {
     pos->eob_rd = _mm256_set1_epi64x(INT64_MAX);
+    pos->eob_info = _mm256_setzero_si256();
   }
 }
 

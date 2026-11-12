@@ -253,6 +253,18 @@ int av2_trellis_quant(const struct AV2_COMP *cpi, MACROBLOCK *x, int plane,
                       const TXB_CTX *const txb_ctx, int *rate_cost,
                       int sharpness);
 
+void av2_trellis_first_pos_node(const tcq_param_t *p, int scan_pos,
+                                tcq_ctx_t *tcq_ctx, tcq_node_t *decision);
+
+#if HAVE_AVX2
+int av2_trellis_quant_luma_avx2(const tcq_param_t *p, struct macroblock *x,
+                                int block, int first_scan_pos, int is_inter,
+                                int is_fsc, int bob_code,
+                                int reduced_tx_set_used, TX_TYPE tx_type,
+                                int txb_skip_ctx, tran_low_t *qcoeff,
+                                tran_low_t *dqcoeff, int *rate_cost);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

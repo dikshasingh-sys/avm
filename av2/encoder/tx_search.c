@@ -22,8 +22,41 @@
 #include "av2/encoder/random.h"
 #include "av2/encoder/rdopt_utils.h"
 #include "av2/encoder/tx_prune_model_weights.h"
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+#include "avm_ports/bitops.h"
 #include "av2/encoder/tx_search.h"
 #include "av2/encoder/tx_cache.h"
+
+static AVM_INLINE int tx_ctz_u32(unsigned int n) {
+  assert(n != 0);
+#if defined(__GNUC__) || defined(__clang__)
+  return __builtin_ctz(n);
+#else
+  return get_msb(n & (0u - n));
+#endif
+}
+
+static const PRIMARY_TX_TYPE kDefaultTxkMap[PRIMARY_TX_TYPES] = {
+  DCT_DCT,
+  ADST_DCT,
+  DCT_ADST,
+  ADST_ADST,
+  FLIPADST_DCT,
+  DCT_FLIPADST,
+  FLIPADST_FLIPADST,
+  ADST_FLIPADST,
+  FLIPADST_ADST,
+  IDTX,
+  V_DCT,
+  H_DCT,
+  V_ADST,
+  H_ADST,
+  V_FLIPADST,
+  H_FLIPADST
+};
 
 struct rdcost_block_args {
   const AV2_COMP *cpi;
@@ -1045,42 +1078,40 @@ static unsigned pixel_dist(const AV2_COMP *const cpi, const MACROBLOCK *x,
                                  visible_cols);
 }
 
-static INLINE int64_t dist_block_px_domain(const AV2_COMP *cpi, MACROBLOCK *x,
-                                           int plane, int block, int blk_row,
-                                           int blk_col, TX_SIZE tx_size) {
+static AVM_FORCE_INLINE int64_t dist_block_px_domain_fast(
+    const AV2_COMP *cpi, MACROBLOCK *x, int plane, int block, int blk_row,
+    int blk_col, TX_SIZE tx_size, TX_TYPE cand_tx_type, int is_fsc,
+    int is_lossless, const uint16_t *src, int src_stride, const uint16_t *dst,
+    int dst_stride, int visible_rows, int visible_cols, int use_ddt,
+    int reduced_tx_set_used, uint16_t *recon) {
   MACROBLOCKD *const xd = &x->e_mbd;
   const struct macroblock_plane *const p = &x->plane[plane];
   const uint16_t eob = p->eobs[block];
   const int bsw = tx_size_wide[tx_size];
   const int bsh = tx_size_high[tx_size];
-  const int src_stride = x->plane[plane].src.stride;
-  const int dst_stride = xd->plane[plane].dst.stride;
-  // Scale the transform block index to pixel unit.
-  const int src_idx = (blk_row * src_stride + blk_col) << MI_SIZE_LOG2;
-  const int dst_idx = (blk_row * dst_stride + blk_col) << MI_SIZE_LOG2;
-  const uint16_t *src = &x->plane[plane].src.buf[src_idx];
-  const uint16_t *dst = &xd->plane[plane].dst.buf[dst_idx];
-  tran_low_t *dqcoeff = p->dqcoeff + BLOCK_OFFSET(block);
-
-  assert(cpi != NULL);
-  assert(tx_size_wide_log2[0] == tx_size_high_log2[0]);
-
-  DECLARE_ALIGNED(16, uint16_t, recon[MAX_TX_SQUARE]);
+  const tran_low_t *dqcoeff = p->dqcoeff + BLOCK_OFFSET(block);
 
   avm_highbd_convolve_copy(dst, dst_stride, recon, MAX_TX_SIZE, bsw, bsh);
 
-  const PLANE_TYPE plane_type = get_plane_type(plane);
-  TX_TYPE tx_type =
-      av2_get_tx_type(xd, plane_type, blk_row, blk_col, tx_size,
-                      is_reduced_tx_set_used(&cpi->common, plane_type));
-  av2_inverse_transform_block(
-      xd, dqcoeff, plane, tx_type, tx_size, recon, MAX_TX_SIZE, eob,
-      replace_adst_by_ddt(cpi->common.seq_params.enable_inter_ddt,
-                          cpi->common.features.allow_screen_content_tools, xd),
-      cpi->common.features.reduced_tx_set_used);
+  TX_TYPE tx_type;
+  if (LIKELY(plane == AVM_PLANE_Y && !is_fsc && !is_lossless &&
+             txsize_sqr_up_map[tx_size] <= TX_32X32)) {
+    tx_type = cand_tx_type;
+    assert(tx_type.packed_tx_type ==
+           av2_get_tx_type(xd, PLANE_TYPE_Y, blk_row, blk_col, tx_size,
+                           is_reduced_tx_set_used(&cpi->common, PLANE_TYPE_Y))
+               .packed_tx_type);
+  } else {
+    const PLANE_TYPE plane_type = get_plane_type(plane);
+    tx_type = av2_get_tx_type(xd, plane_type, blk_row, blk_col, tx_size,
+                              is_reduced_tx_set_used(&cpi->common, plane_type));
+  }
+  av2_inverse_transform_block(xd, dqcoeff, plane, tx_type, tx_size, recon,
+                              MAX_TX_SIZE, eob, use_ddt, reduced_tx_set_used);
 
-  return 16 * pixel_dist(cpi, x, plane, src, src_stride, recon, MAX_TX_SIZE,
-                         blk_row, blk_col, tx_size);
+  return 16 * (int64_t)pixel_dist_visible_only(cpi, x, src, src_stride, recon,
+                                               MAX_TX_SIZE, tx_size, bsh, bsw,
+                                               visible_rows, visible_cols);
 }
 
 // Evaluate U and V distortion jointly for cross chroma component transform
@@ -1306,13 +1337,125 @@ static AVM_INLINE void get_energy_distribution_finer(const int16_t *diff,
                                                      float *verdist) {
   // First compute downscaled block energy values (esq); downscale factors
   // are defined by w_shift and h_shift.
-  unsigned int esq[256];
+  DECLARE_ALIGNED(16, unsigned int, esq[256]);
   const int w_shift = bw <= 8 ? 0 : 1;
   const int h_shift = bh <= 8 ? 0 : 1;
   const int esq_w = bw >> w_shift;
   const int esq_h = bh >> h_shift;
-  const int esq_sz = esq_w * esq_h;
   int i, j;
+  uint64_t total = 0;
+#if defined(__SSE2__)
+  const __m128i zero = _mm_setzero_si128();
+  __m128i v_total = zero;
+  if (w_shift) {
+    if (h_shift) {
+      for (i = 0; i < bh; i += 2) {
+        unsigned int *cur_esq_row = esq + (i >> 1) * esq_w;
+        const int16_t *r0 = diff + i * stride;
+        const int16_t *r1 = r0 + stride;
+        for (j = 0; j < bw; j += 8) {
+          const __m128i d0 = _mm_loadu_si128((const __m128i *)(r0 + j));
+          const __m128i d1 = _mm_loadu_si128((const __m128i *)(r1 + j));
+          const __m128i s =
+              _mm_add_epi32(_mm_madd_epi16(d0, d0), _mm_madd_epi16(d1, d1));
+          _mm_storeu_si128((__m128i *)(cur_esq_row + (j >> 1)), s);
+          v_total = _mm_add_epi64(v_total,
+                                  _mm_add_epi64(_mm_unpacklo_epi32(s, zero),
+                                                _mm_unpackhi_epi32(s, zero)));
+        }
+      }
+    } else {
+      for (i = 0; i < bh; i++) {
+        unsigned int *cur_esq_row = esq + i * esq_w;
+        const int16_t *r0 = diff + i * stride;
+        for (j = 0; j < bw; j += 8) {
+          const __m128i d0 = _mm_loadu_si128((const __m128i *)(r0 + j));
+          const __m128i s = _mm_madd_epi16(d0, d0);
+          _mm_storeu_si128((__m128i *)(cur_esq_row + (j >> 1)), s);
+          v_total = _mm_add_epi64(v_total,
+                                  _mm_add_epi64(_mm_unpacklo_epi32(s, zero),
+                                                _mm_unpackhi_epi32(s, zero)));
+        }
+      }
+    }
+  } else if (bw == 8) {
+    if (h_shift) {
+      for (i = 0; i < bh; i += 2) {
+        unsigned int *cur_esq_row = esq + (i >> 1) * 8;
+        const __m128i d0 =
+            _mm_loadu_si128((const __m128i *)(diff + i * stride));
+        const __m128i d1 =
+            _mm_loadu_si128((const __m128i *)(diff + (i + 1) * stride));
+        const __m128i d0_lo = _mm_unpacklo_epi16(d0, zero);
+        const __m128i d0_hi = _mm_unpackhi_epi16(d0, zero);
+        const __m128i d1_lo = _mm_unpacklo_epi16(d1, zero);
+        const __m128i d1_hi = _mm_unpackhi_epi16(d1, zero);
+        const __m128i s_lo = _mm_add_epi32(_mm_madd_epi16(d0_lo, d0_lo),
+                                           _mm_madd_epi16(d1_lo, d1_lo));
+        const __m128i s_hi = _mm_add_epi32(_mm_madd_epi16(d0_hi, d0_hi),
+                                           _mm_madd_epi16(d1_hi, d1_hi));
+        _mm_storeu_si128((__m128i *)cur_esq_row, s_lo);
+        _mm_storeu_si128((__m128i *)(cur_esq_row + 4), s_hi);
+        const __m128i s_sum = _mm_add_epi32(s_lo, s_hi);
+        v_total = _mm_add_epi64(v_total,
+                                _mm_add_epi64(_mm_unpacklo_epi32(s_sum, zero),
+                                              _mm_unpackhi_epi32(s_sum, zero)));
+      }
+    } else {
+      for (i = 0; i < bh; i++) {
+        unsigned int *cur_esq_row = esq + i * 8;
+        const __m128i d0 =
+            _mm_loadu_si128((const __m128i *)(diff + i * stride));
+        const __m128i d0_lo = _mm_unpacklo_epi16(d0, zero);
+        const __m128i d0_hi = _mm_unpackhi_epi16(d0, zero);
+        const __m128i s_lo = _mm_madd_epi16(d0_lo, d0_lo);
+        const __m128i s_hi = _mm_madd_epi16(d0_hi, d0_hi);
+        _mm_storeu_si128((__m128i *)cur_esq_row, s_lo);
+        _mm_storeu_si128((__m128i *)(cur_esq_row + 4), s_hi);
+        const __m128i s_sum = _mm_add_epi32(s_lo, s_hi);
+        v_total = _mm_add_epi64(v_total,
+                                _mm_add_epi64(_mm_unpacklo_epi32(s_sum, zero),
+                                              _mm_unpackhi_epi32(s_sum, zero)));
+      }
+    }
+  } else {
+    assert(bw == 4);
+    if (h_shift) {
+      for (i = 0; i < bh; i += 2) {
+        unsigned int *cur_esq_row = esq + (i >> 1) * 4;
+        const __m128i d0 = _mm_unpacklo_epi16(
+            _mm_loadl_epi64((const __m128i *)(diff + i * stride)), zero);
+        const __m128i d1 = _mm_unpacklo_epi16(
+            _mm_loadl_epi64((const __m128i *)(diff + (i + 1) * stride)), zero);
+        const __m128i s =
+            _mm_add_epi32(_mm_madd_epi16(d0, d0), _mm_madd_epi16(d1, d1));
+        _mm_storeu_si128((__m128i *)cur_esq_row, s);
+        v_total =
+            _mm_add_epi64(v_total, _mm_add_epi64(_mm_unpacklo_epi32(s, zero),
+                                                 _mm_unpackhi_epi32(s, zero)));
+      }
+    } else {
+      for (i = 0; i < bh; i++) {
+        unsigned int *cur_esq_row = esq + i * 4;
+        const __m128i d0 = _mm_unpacklo_epi16(
+            _mm_loadl_epi64((const __m128i *)(diff + i * stride)), zero);
+        const __m128i s = _mm_madd_epi16(d0, d0);
+        _mm_storeu_si128((__m128i *)cur_esq_row, s);
+        v_total =
+            _mm_add_epi64(v_total, _mm_add_epi64(_mm_unpacklo_epi32(s, zero),
+                                                 _mm_unpackhi_epi32(s, zero)));
+      }
+    }
+  }
+  const __m128i v_total_hi = _mm_srli_si128(v_total, 8);
+  const __m128i v_total_sum = _mm_add_epi64(v_total, v_total_hi);
+#if defined(__x86_64__)
+  total = (uint64_t)_mm_cvtsi128_si64(v_total_sum);
+#else
+  _mm_storel_epi64((__m128i *)&total, v_total_sum);
+#endif
+#else
+  const int esq_sz = esq_w * esq_h;
   memset(esq, 0, esq_sz * sizeof(esq[0]));
   if (w_shift) {
     for (i = 0; i < bh; i++) {
@@ -1332,9 +1475,8 @@ static AVM_INLINE void get_energy_distribution_finer(const int16_t *diff,
       }
     }
   }
-
-  uint64_t total = 0;
   for (i = 0; i < esq_sz; i++) total += esq[i];
+#endif
 
   // Output hordist and verdist arrays are normalized 1D projections of esq
   if (total == 0) {
@@ -1364,7 +1506,7 @@ static AVM_INLINE void get_energy_distribution_finer(const int16_t *diff,
   for (i = 0; i < esq_h - 1; i++) verdist[i] *= e_recip;
 }
 
-static void prune_tx_2D(MACROBLOCK *x, BLOCK_SIZE bsize, TX_SIZE tx_size,
+static bool prune_tx_2D(MACROBLOCK *x, BLOCK_SIZE bsize, TX_SIZE tx_size,
                         int blk_row, int blk_col, TxSetType tx_set_type,
                         TX_TYPE_PRUNE_MODE prune_2d_txfm_mode,
                         PRIMARY_TX_TYPE *txk_map, uint16_t *allowed_tx_mask) {
@@ -1376,7 +1518,7 @@ static void prune_tx_2D(MACROBLOCK *x, BLOCK_SIZE bsize, TX_SIZE tx_size,
   };
   if (tx_set_type != EXT_TX_SET_ALL16 &&
       tx_set_type != EXT_TX_SET_DTT9_IDTX_1DDCT)
-    return;
+    return false;
 #if CONFIG_NN_V2
   NN_CONFIG_V2 *nn_config_hor = av2_tx_type_nnconfig_map_hor[tx_size];
   NN_CONFIG_V2 *nn_config_ver = av2_tx_type_nnconfig_map_ver[tx_size];
@@ -1384,7 +1526,8 @@ static void prune_tx_2D(MACROBLOCK *x, BLOCK_SIZE bsize, TX_SIZE tx_size,
   const NN_CONFIG *nn_config_hor = av2_tx_type_nnconfig_map_hor[tx_size];
   const NN_CONFIG *nn_config_ver = av2_tx_type_nnconfig_map_ver[tx_size];
 #endif
-  if (!nn_config_hor || !nn_config_ver) return;  // Model not established yet.
+  if (!nn_config_hor || !nn_config_ver)
+    return false;  // Model not established yet.
 
   avm_clear_system_state();
   float hfeatures[16], vfeatures[16];
@@ -1488,15 +1631,14 @@ static void prune_tx_2D(MACROBLOCK *x, BLOCK_SIZE bsize, TX_SIZE tx_size,
   }
   memcpy(txk_map, tx_type_table_2D, sizeof(tx_type_table_2D));
   *allowed_tx_mask = allow_bitmask;
+  return true;
 }
 
-static AVM_INLINE uint16_t get_tx_mask(const AV2_COMP *cpi, MACROBLOCK *x,
-                                       int plane, int blk_row, int blk_col,
-                                       BLOCK_SIZE plane_bsize, TX_SIZE tx_size,
-                                       FAST_TX_SEARCH_MODE ftxs_mode,
-                                       int dc_only_blk,
-                                       PRIMARY_TX_TYPE *allowed_txk_types,
-                                       PRIMARY_TX_TYPE *txk_map) {
+static AVM_INLINE uint16_t get_tx_mask(
+    const AV2_COMP *cpi, MACROBLOCK *x, int plane, int blk_row, int blk_col,
+    BLOCK_SIZE plane_bsize, TX_SIZE tx_size, FAST_TX_SEARCH_MODE ftxs_mode,
+    int dc_only_blk, PRIMARY_TX_TYPE *allowed_txk_types,
+    PRIMARY_TX_TYPE *txk_map, bool *txk_reordered) {
   if (dc_only_blk) {
     *allowed_txk_types = DCT_DCT;
     return ALLOW_TX_MASK(DCT_DCT);
@@ -1636,8 +1778,9 @@ static AVM_INLINE uint16_t get_tx_mask(const AV2_COMP *cpi, MACROBLOCK *x,
         num_allowed > allowed_tx_count) {
       const uint16_t scc_tx_mask =
           allowed_tx_mask & ((1 << IDTX) | (1 << V_DCT) | (1 << H_DCT));
-      prune_tx_2D(x, plane_bsize, tx_size, blk_row, blk_col, tx_set_type,
-                  txfm_params->prune_2d_txfm_mode, txk_map, &allowed_tx_mask);
+      *txk_reordered = prune_tx_2D(x, plane_bsize, tx_size, blk_row, blk_col,
+                                   tx_set_type, txfm_params->prune_2d_txfm_mode,
+                                   txk_map, &allowed_tx_mask);
       if (cpi->sf.tx_sf.tx_type_search.winner_mode_tx_type_pruning >= 1 &&
           cm->features.is_scc_content_by_detector) {
         allowed_tx_mask |= scc_tx_mask;
@@ -2015,118 +2158,40 @@ static AVM_INLINE bool prune_rectangular_tx_type(
   return false;
 }
 
-// Calculate distortion for a given transform block
-static AVM_INLINE RD_STATS get_tx_blk_distortion(
-    const AV2_COMP *cpi, MACROBLOCK *x, int plane, int block, int blk_row,
-    int blk_col, TX_SIZE tx_size, int64_t block_sse, int eob, int dc_only_blk,
-    int fsc_mode_in, int use_transform_domain_distortion) {
-  RD_STATS this_rd_stats;
-  av2_invalid_rd_stats(&this_rd_stats);
-
-  if (eob == 0) {
-    // When eob is 0, pixel domain distortion is more efficient and
-    // accurate.
-    this_rd_stats.dist = this_rd_stats.sse = block_sse;
-  } else if (dc_only_blk || (fsc_mode_in && plane == AVM_PLANE_Y)) {
-    this_rd_stats.sse = block_sse;
-    this_rd_stats.dist =
-        dist_block_px_domain(cpi, x, plane, block, blk_row, blk_col, tx_size);
-  } else if (use_transform_domain_distortion) {
-    dist_block_tx_domain(x, plane, block, tx_size, &this_rd_stats.dist,
-                         &this_rd_stats.sse);
-    if (txsize_sqr_up_map[tx_size] == TX_64X64) {
-      // For 64-length transforms, only a 2x downsampled (32-length) version
-      // of the residue is coded. As the forward transform is the orthogonal
-      // projection onto the (2x replicated) 32-point basis functions, the
-      // pixel domain distortion is the sum of the quantization error of the
-      // coded coefficients and the energy lost by the downsampling, i.e.
-      // (block_sse - coded_sse).
-      this_rd_stats.dist += AVMMAX(block_sse - this_rd_stats.sse, 0);
-      this_rd_stats.sse = block_sse;
-    }
-  } else {
-    int64_t sse_diff = INT64_MAX;
-    // high_energy threshold assumes that every pixel within a txfm block
-    // has a residue energy of at least 25% of the maximum, i.e. 128 * 128
-    // for 8 bit.
-    const int64_t high_energy_thresh =
-        ((int64_t)128 * 128 * tx_size_2d[tx_size]);
-    const int is_high_energy = (block_sse >= high_energy_thresh);
-    if (tx_size == TX_64X64 || is_high_energy) {
-      // For 64-length transforms, only a downsampled (32-length) version of
-      // the residue is coded (the decoder upsamples the 32-point inverse
-      // transform output by 2x replication), so the inverse transform has a
-      // tendency to overflow. sse_diff is effectively the energy lost by
-      // that downsampling, here we use it to decide if we should do pixel
-      // domain distortion. If the energy is mostly captured by the coded
-      // coefficients, then it is unlikely that we have overflow issue in
-      // inverse transform.
-      dist_block_tx_domain(x, plane, block, tx_size, &this_rd_stats.dist,
-                           &this_rd_stats.sse);
-      sse_diff = block_sse - this_rd_stats.sse;
-    }
-
-    if (tx_size != TX_64X64 || !is_high_energy ||
-        (sse_diff * 2) < this_rd_stats.sse) {
-      const int64_t tx_domain_dist = this_rd_stats.dist;
-      this_rd_stats.dist =
-          dist_block_px_domain(cpi, x, plane, block, blk_row, blk_col, tx_size);
-      // For high energy blocks, occasionally, the pixel domain distortion
-      // can be artificially low due to clamping at reconstruction stage
-      // even when inverse transform output is hugely different from the
-      // actual residue.
-      if (is_high_energy && this_rd_stats.dist < tx_domain_dist)
-        this_rd_stats.dist = tx_domain_dist;
-    } else {
-      assert(sse_diff < INT64_MAX);
-      this_rd_stats.dist += sse_diff;
-    }
-    this_rd_stats.sse = block_sse;
-  }
-  return this_rd_stats;
-}
-
 // Lightweight pre-distortion RD gate used inside search_tx_type's inner loop.
 // Computes an approximate RD cost using transform-domain distortion and returns
-// true when the candidate should be skipped (pruned).
+// true when the candidate should be skipped (pruned). When the candidate
+// survives, caches (tx_dist, tx_sse) so get_tx_blk_distortion() does not
+// recompute dist_block_tx_domain().
 static INLINE bool prune_tx_type_rd_calc_using_tx_domain_dist(
     MACROBLOCK *x, const uint16_t *eobs_ptr, int64_t block_sse,
     int64_t sec_tx_sse_to_be_coded, int64_t best_rd, int64_t ref_best_rd,
     int plane, int block, int stx, int rate_cost,
     int use_transform_domain_distortion, TX_SIZE tx_size,
-    bool skip_pixel_dist_calc_using_tx_dist) {
+    bool skip_pixel_dist_calc_using_tx_dist, bool *has_tx_dist,
+    int64_t *out_tx_dist, int64_t *out_tx_sse) {
   if (!skip_pixel_dist_calc_using_tx_dist || eobs_ptr[block] == 0 ||
       best_rd == INT64_MAX || use_transform_domain_distortion)
     return false;
 
-  // sec_tx_sse_to_be_coded is the residual SSE after the forward
-  // secondary transform, set by the prune_tx_rd_eval_sec_tx_sse filter earlier
-  // in the loop. When available, block_sse - sec_tx_sse_to_be_coded is the
-  // minimum distortion. If even this optimistic estimate exceeds best_rd or
-  // ref_best_rd, there is no need to run the more expensive
-  // dist_block_tx_domain() call below.
   if (sec_tx_sse_to_be_coded != INT64_MAX) {
     int64_t tmp_rd = RDCOST(x->rdmult, rate_cost,
                             AVMMAX((block_sse - sec_tx_sse_to_be_coded), 0));
     if (tmp_rd > AVMMIN(best_rd, ref_best_rd)) return true;
   }
 
-  // Compute the tx-domain distortion. For 64x64 blocks or when a secondary
-  // transform (stx) is applied, the coded coefficients cover only part of the
-  // transform domain, so the residual energy (block_sse - coded_sse) is added
-  // as a correction. Prune if the resulting RD exceeds the threshold.
-  RD_STATS this_rd_stats;
-  dist_block_tx_domain(x, plane, block, tx_size, &this_rd_stats.dist,
-                       &this_rd_stats.sse);
-  int64_t tx_domain_dist;
-  if (stx != 0 || txsize_sqr_up_map[tx_size] == TX_64X64)
-    tx_domain_dist =
-        this_rd_stats.dist + AVMMAX((block_sse - this_rd_stats.sse), 0);
-  else
-    tx_domain_dist = this_rd_stats.dist;
+  int64_t tx_dist, tx_sse;
+  dist_block_tx_domain(x, plane, block, tx_size, &tx_dist, &tx_sse);
+  const int64_t tx_domain_dist =
+      (stx != 0 || txsize_sqr_up_map[tx_size] == TX_64X64)
+          ? tx_dist + AVMMAX((block_sse - tx_sse), 0)
+          : tx_dist;
   const int64_t tx_domain_rd = RDCOST(x->rdmult, rate_cost, tx_domain_dist);
   if (tx_domain_rd > AVMMIN(best_rd, ref_best_rd)) return true;
 
+  *has_tx_dist = true;
+  *out_tx_dist = tx_dist;
+  *out_tx_sse = tx_sse;
   return false;
 }
 
@@ -2188,8 +2253,10 @@ static AVM_INLINE bool winner_mode_tx_partition_preselected(
 // close to orthonormal, so the energy of that region bounds the energy any IST
 // kernel can keep. Scaled the same way as sec_tx_sse in av2_fwd_stxfm().
 static AVM_INLINE int64_t get_ist_input_energy_bound(const MACROBLOCK *x,
-                                                     TX_SIZE tx_size, int bd) {
-  const int32_t *const coeff = x->plane[AVM_PLANE_Y].temp_coeff;
+                                                     int block, TX_SIZE tx_size,
+                                                     int bd) {
+  const tran_low_t *const coeff =
+      x->plane[AVM_PLANE_Y].coeff + BLOCK_OFFSET(block);
   const int width = AVMMIN(tx_size_wide[tx_size], 32);
   const int height = AVMMIN(tx_size_high[tx_size], 32);
   const int sb_size = (width >= 8 && height >= 8) ? 8 : 4;
@@ -2232,7 +2299,87 @@ typedef struct {
   const TXB_CTX *txb_ctx;
   int use_transform_domain_distortion;
   int max_eob;
+  int visible_rows;
+  int visible_cols;
+  const uint16_t *src;
+  int src_stride;
+  uint16_t *dst;
+  int dst_stride;
+  int use_qmatrix;
+  int use_ddt;
+  int reduced_tx_set_used;
+  bool need_recon_intra;
 } TxSearchCtx;
+
+// Calculate distortion for a given transform block.
+static AVM_INLINE RD_STATS get_tx_blk_distortion(
+    const TxSearchCtx *ctx, TX_TYPE tx_type, int eob, int fsc_mode_in,
+    bool has_tx_dist, int64_t cached_tx_dist, int64_t cached_tx_sse,
+    uint16_t *recon, bool *did_px_recon) {
+  RD_STATS this_rd_stats;
+  av2_invalid_rd_stats(&this_rd_stats);
+  *did_px_recon = false;
+  MACROBLOCK *const x = ctx->x;
+  const TX_SIZE tx_size = ctx->tx_size;
+  const int64_t block_sse = ctx->block_sse;
+
+  if (eob == 0) {
+    this_rd_stats.dist = this_rd_stats.sse = block_sse;
+  } else if (ctx->dc_only_blk || (fsc_mode_in && ctx->plane == AVM_PLANE_Y)) {
+    this_rd_stats.sse = block_sse;
+    this_rd_stats.dist = dist_block_px_domain_fast(
+        ctx->cpi, x, ctx->plane, ctx->block, ctx->blk_row, ctx->blk_col,
+        tx_size, tx_type, ctx->is_fsc, ctx->is_lossless, ctx->src,
+        ctx->src_stride, ctx->dst, ctx->dst_stride, ctx->visible_rows,
+        ctx->visible_cols, ctx->use_ddt, ctx->reduced_tx_set_used, recon);
+    *did_px_recon = true;
+  } else if (ctx->use_transform_domain_distortion) {
+    if (has_tx_dist) {
+      this_rd_stats.dist = cached_tx_dist;
+      this_rd_stats.sse = cached_tx_sse;
+    } else {
+      dist_block_tx_domain(x, ctx->plane, ctx->block, tx_size,
+                           &this_rd_stats.dist, &this_rd_stats.sse);
+    }
+    if (txsize_sqr_up_map[tx_size] == TX_64X64) {
+      this_rd_stats.dist += AVMMAX(block_sse - this_rd_stats.sse, 0);
+      this_rd_stats.sse = block_sse;
+    }
+  } else {
+    int64_t sse_diff = INT64_MAX;
+    const int64_t high_energy_thresh =
+        ((int64_t)128 * 128 * tx_size_2d[tx_size]);
+    const int is_high_energy = (block_sse >= high_energy_thresh);
+    if (tx_size == TX_64X64 || is_high_energy) {
+      if (has_tx_dist) {
+        this_rd_stats.dist = cached_tx_dist;
+        this_rd_stats.sse = cached_tx_sse;
+      } else {
+        dist_block_tx_domain(x, ctx->plane, ctx->block, tx_size,
+                             &this_rd_stats.dist, &this_rd_stats.sse);
+      }
+      sse_diff = block_sse - this_rd_stats.sse;
+    }
+
+    if (tx_size != TX_64X64 || !is_high_energy ||
+        (sse_diff * 2) < this_rd_stats.sse) {
+      const int64_t tx_domain_dist = this_rd_stats.dist;
+      this_rd_stats.dist = dist_block_px_domain_fast(
+          ctx->cpi, x, ctx->plane, ctx->block, ctx->blk_row, ctx->blk_col,
+          tx_size, tx_type, ctx->is_fsc, ctx->is_lossless, ctx->src,
+          ctx->src_stride, ctx->dst, ctx->dst_stride, ctx->visible_rows,
+          ctx->visible_cols, ctx->use_ddt, ctx->reduced_tx_set_used, recon);
+      *did_px_recon = true;
+      if (is_high_energy && this_rd_stats.dist < tx_domain_dist)
+        this_rd_stats.dist = tx_domain_dist;
+    } else {
+      assert(sse_diff < INT64_MAX);
+      this_rd_stats.dist += sse_diff;
+    }
+    this_rd_stats.sse = block_sse;
+  }
+  return this_rd_stats;
+}
 
 // Evaluates one transform type candidate and updates the best candidate.
 // Returns the RD cost of the candidate, or INT64_MAX if it is pruned.
@@ -2243,13 +2390,13 @@ static AVM_FORCE_INLINE int64_t evaluate_tx_candidate(
     int *coeffs_available, bool *eob_found, int64_t *best_rd,
     RD_STATS *best_rd_stats, TX_TYPE *best_tx_type, uint8_t *best_txb_ctx,
     uint16_t *best_eob, tran_low_t **best_dqcoeff, bool *early_term,
-    int *ist_buf_filled) {
+    int *ist_buf_filled, uint16_t (*recon_buf)[MAX_TX_SQUARE],
+    int *cur_recon_idx, int *best_recon_idx) {
   const AV2_COMP *const cpi = ctx->cpi;
   const AV2_COMMON *const cm = &cpi->common;
   const TX_SPEED_FEATURES *const tx_sf = &cpi->sf.tx_sf;
   MACROBLOCK *const x = ctx->x;
   MACROBLOCKD *const xd = &x->e_mbd;
-  MB_MODE_INFO *const mbmi = xd->mi[0];
   const TxfmSearchParams *const txfm_params = &x->txfm_search_params;
   struct macroblock_plane *const mb_plane = &x->plane[ctx->plane];
   const uint16_t *const eobs_ptr = mb_plane->eobs;
@@ -2261,7 +2408,7 @@ static AVM_FORCE_INLINE int64_t evaluate_tx_candidate(
 
   assert(av2_tx_type_in_range(tx_type.primary_tx, tx_type.sec_tx,
                               tx_type.sec_set, ctx->txw, ctx->txh));
-  if (av2_use_qmatrix(&cm->quant_params, xd, mbmi->segment_id)) {
+  if (ctx->use_qmatrix) {
     av2_setup_qmatrix(&cm->quant_params, xd, ctx->plane, ctx->tx_size,
                       tx_type.primary_tx, quant_param);
   }
@@ -2348,7 +2495,7 @@ static AVM_FORCE_INLINE int64_t evaluate_tx_candidate(
 
     rate_cost =
         cost_coeffs(cm, x, ctx->plane, ctx->block, ctx->tx_size, tx_type,
-                    CCTX_NONE, ctx->txb_ctx, cm->features.reduced_tx_set_used);
+                    CCTX_NONE, ctx->txb_ctx, ctx->reduced_tx_set_used);
   }
   // Post-trellis safety net: re-apply the same eob == 0 / eob == 1
   // pre-skip logic in case trellis (RDOQ) adjusted the eob across
@@ -2363,17 +2510,21 @@ static AVM_FORCE_INLINE int64_t evaluate_tx_candidate(
   // terminate early.
   if (RDCOST(x->rdmult, rate_cost, 0) > *best_rd) return INT64_MAX;
 
+  bool has_tx_dist = false;
+  int64_t cached_tx_dist = 0;
+  int64_t cached_tx_sse = 0;
   if (prune_tx_type_rd_calc_using_tx_domain_dist(
           x, eobs_ptr, ctx->block_sse, sec_tx_sse_to_be_coded, *best_rd,
           ctx->ref_best_rd, ctx->plane, ctx->block, stx, rate_cost,
           ctx->use_transform_domain_distortion, ctx->tx_size,
-          tx_sf->skip_pixel_dist_calc_using_tx_dist)) {
+          tx_sf->skip_pixel_dist_calc_using_tx_dist, &has_tx_dist,
+          &cached_tx_dist, &cached_tx_sse)) {
     return INT64_MAX;
   }
+  bool did_px_recon = false;
   RD_STATS this_rd_stats = get_tx_blk_distortion(
-      cpi, x, ctx->plane, ctx->block, ctx->blk_row, ctx->blk_col, ctx->tx_size,
-      ctx->block_sse, eobs_ptr[ctx->block], ctx->dc_only_blk, fsc_mode_in,
-      ctx->use_transform_domain_distortion);
+      ctx, tx_type, eobs_ptr[ctx->block], fsc_mode_in, has_tx_dist,
+      cached_tx_dist, cached_tx_sse, recon_buf[*cur_recon_idx], &did_px_recon);
 
   this_rd_stats.rate = rate_cost;
 
@@ -2393,6 +2544,14 @@ static AVM_FORCE_INLINE int64_t evaluate_tx_candidate(
     tran_low_t *const tmp_dqcoeff = *best_dqcoeff;
     *best_dqcoeff = mb_plane->dqcoeff;
     mb_plane->dqcoeff = tmp_dqcoeff;
+    if (ctx->need_recon_intra) {
+      if (did_px_recon) {
+        *best_recon_idx = *cur_recon_idx;
+        *cur_recon_idx ^= 1;
+      } else {
+        *best_recon_idx = -1;
+      }
+    }
   }
 
 #if CONFIG_COLLECT_RD_STATS == 1
@@ -2497,22 +2656,8 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
   // txk_allowed = PRIMARY_TX_TYPES: >1 tx types are allowed.
   // txk_allowed < PRIMARY_TX_TYPES: only that specific tx type is allowed.
   PRIMARY_TX_TYPE txk_allowed = PRIMARY_TX_TYPES;
-  PRIMARY_TX_TYPE txk_map[PRIMARY_TX_TYPES] = { DCT_DCT,
-                                                ADST_DCT,
-                                                DCT_ADST,
-                                                ADST_ADST,
-                                                FLIPADST_DCT,
-                                                DCT_FLIPADST,
-                                                FLIPADST_FLIPADST,
-                                                ADST_FLIPADST,
-                                                FLIPADST_ADST,
-                                                IDTX,
-                                                V_DCT,
-                                                H_DCT,
-                                                V_ADST,
-                                                H_ADST,
-                                                V_FLIPADST,
-                                                H_FLIPADST };
+  PRIMARY_TX_TYPE txk_map_buf[PRIMARY_TX_TYPES];
+  bool txk_reordered = false;
 
   const int dequant_shift = xd->bd - 5;
 
@@ -2544,9 +2689,9 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
   }
 
   // Bit mask to indicate which transform types are allowed in the RD search.
-  uint16_t allowed_tx_mask =
-      get_tx_mask(cpi, x, plane, blk_row, blk_col, plane_bsize, tx_size,
-                  ftxs_mode, dc_only_blk, &txk_allowed, txk_map);
+  uint16_t allowed_tx_mask = get_tx_mask(
+      cpi, x, plane, blk_row, blk_col, plane_bsize, tx_size, ftxs_mode,
+      dc_only_blk, &txk_allowed, txk_map_buf, &txk_reordered);
 
   block_sse = ROUND_POWER_OF_TWO(block_sse, (xd->bd - 8) * 2);
   block_mse_q8 = ROUND_POWER_OF_TWO(block_mse_q8, (xd->bd - 8) * 2);
@@ -2607,12 +2752,19 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
   const bool is_rect_horz = txw > txh;
   PRIMARY_TX_TYPE best_long_side_tx_type = DCT_DCT;
 
-  const int is_border_block = get_visible_dimensions(
-      xd, plane, blk_col, blk_row, txw, txh, cm->width, cm->height, NULL, NULL);
+  int visible_cols = txw;
+  int visible_rows = txh;
+  const int is_border_block =
+      get_visible_dimensions(xd, plane, blk_col, blk_row, txw, txh, cm->width,
+                             cm->height, &visible_cols, &visible_rows);
 
   xd->enable_ist = (is_inter ? cm->seq_params.enable_inter_ist
                              : cm->seq_params.enable_ist) &&
                    !is_fsc && !is_lossless;
+
+  const int use_qmatrix =
+      av2_use_qmatrix(&cm->quant_params, xd, mbmi->segment_id);
+  const int reduced_tx_set_used = cm->features.reduced_tx_set_used;
 
   // Transform search result cache.  Deliberately placed here: it is after
   // skip_trellis is final and after the block above that turns off
@@ -2633,12 +2785,10 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
                           txb_ctx ? txb_ctx->txb_skip_ctx : 0,
                           txb_ctx ? txb_ctx->dc_sign_ctx : 0) ^
         (tx_size << 1);
-    tx_cache_key = av2_tx_cache_mix(
-        base, 0u, 0u, is_inter, is_fsc, intra_mode, x->rd_model, skip_trellis,
-        av2_get_ext_tx_set_type(tx_size, is_inter,
-                                cm->features.reduced_tx_set_used),
-        av2_use_qmatrix(&cm->quant_params, xd, mbmi->segment_id), x->rdmult,
-        x->apply_dry_pass_shortcuts);
+    tx_cache_key =
+        av2_tx_cache_mix(base, 0u, 0u, is_inter, is_fsc, intra_mode,
+                         x->rd_model, skip_trellis, txfm_param.tx_set_type,
+                         use_qmatrix, x->rdmult, x->apply_dry_pass_shortcuts);
     const int cached = av2_tx_cache_lookup(tx_cache, tx_cache_key);
     if (cached >= 0) {
       tx_cache_hit = 1;
@@ -2661,6 +2811,16 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
   }
 
   const int max_eob = av2_get_max_eob(tx_size);
+  const int src_stride = mb_plane->src.stride;
+  const int dst_stride = xd->plane[plane].dst.stride;
+  const bool need_recon_intra =
+      !is_inter && plane == AVM_PLANE_Y &&
+      (blk_row + tx_size_high_unit[tx_size] < mi_size_high[plane_bsize] ||
+       blk_col + tx_size_wide_unit[tx_size] < mi_size_wide[plane_bsize]);
+
+  DECLARE_ALIGNED(32, uint16_t, recon_buf[2][MAX_TX_SQUARE]);
+  int cur_recon_idx = 0;
+  int best_recon_idx = -1;
 
   TxSearchCtx ctx;
   ctx.cpi = cpi;
@@ -2685,23 +2845,58 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
   ctx.txb_ctx = txb_ctx;
   ctx.use_transform_domain_distortion = use_transform_domain_distortion;
   ctx.max_eob = max_eob;
+  ctx.visible_rows = visible_rows;
+  ctx.visible_cols = visible_cols;
+  ctx.src =
+      &mb_plane->src.buf[(blk_row * src_stride + blk_col) << MI_SIZE_LOG2];
+  ctx.src_stride = src_stride;
+  ctx.dst = &xd->plane[plane]
+                 .dst.buf[(blk_row * dst_stride + blk_col) << MI_SIZE_LOG2];
+  ctx.dst_stride = dst_stride;
+  ctx.use_qmatrix = use_qmatrix;
+  ctx.use_ddt = txfm_param.use_ddt;
+  ctx.reduced_tx_set_used = reduced_tx_set_used;
+  ctx.need_recon_intra = need_recon_intra;
+
+  const bool use_rect_tx_prune =
+      (txfm_param.tx_set_type == EXT_TX_SET_LONG_SIDE_32 ||
+       txfm_param.tx_set_type == EXT_TX_SET_LONG_SIDE_64);
+  PRIMARY_TX_TYPE active_tx_list[PRIMARY_TX_TYPES];
+  int num_tx_iters = PRIMARY_TX_TYPES;
+  const PRIMARY_TX_TYPE *const txk_map =
+      txk_reordered ? txk_map_buf : kDefaultTxkMap;
+  if (!txk_reordered && !use_rect_tx_prune) {
+    uint32_t eff_mask = allowed_tx_mask;
+    if (is_fsc && plane == AVM_PLANE_Y) {
+      eff_mask &= (1u << IDTX);
+    } else if (!is_lossless && !is_fsc && !is_inter) {
+      eff_mask &= ~(1u << IDTX);
+    }
+    num_tx_iters = 0;
+    for (; eff_mask != 0; eff_mask &= eff_mask - 1) {
+      active_tx_list[num_tx_iters++] = (PRIMARY_TX_TYPE)tx_ctz_u32(eff_mask);
+    }
+  }
 
   // For each primary transform type, evaluate the primary trial (stx = 0)
   // first, then its secondary transform (IST) trials.
-  for (int tx_idx = 0; tx_idx < PRIMARY_TX_TYPES; ++tx_idx) {
-    PRIMARY_TX_TYPE primary_tx_type = txk_map[tx_idx];
-    if (prune_rectangular_tx_type(tx_idx, txfm_param.tx_set_type, plane, is_fsc,
-                                  is_rect_horz, allowed_tx_mask, best_tx_type,
-                                  &primary_tx_type, &best_long_side_tx_type)) {
-      continue;
-    }
-    if (!(allowed_tx_mask & (1 << primary_tx_type))) continue;
-    if (is_fsc && primary_tx_type != IDTX && plane == AVM_PLANE_Y) {
-      continue;
-    }
-
-    if (!is_lossless) {
-      if (!is_fsc && primary_tx_type == IDTX && !is_inter) {
+  for (int tx_idx = 0; tx_idx < num_tx_iters; ++tx_idx) {
+    PRIMARY_TX_TYPE primary_tx_type;
+    if (!txk_reordered && !use_rect_tx_prune) {
+      primary_tx_type = active_tx_list[tx_idx];
+    } else {
+      primary_tx_type = txk_map[tx_idx];
+      if (prune_rectangular_tx_type(tx_idx, txfm_param.tx_set_type, plane,
+                                    is_fsc, is_rect_horz, allowed_tx_mask,
+                                    best_tx_type, &primary_tx_type,
+                                    &best_long_side_tx_type)) {
+        continue;
+      }
+      if (!(allowed_tx_mask & (1 << primary_tx_type))) continue;
+      if (is_fsc && primary_tx_type != IDTX && plane == AVM_PLANE_Y) {
+        continue;
+      }
+      if (!is_lossless && !is_fsc && primary_tx_type == IDTX && !is_inter) {
         continue;
       }
     }
@@ -2729,7 +2924,6 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
     const int max_set_id =
         get_ist_max_set_id(skip_stx, is_inter, txw, txh, primary_tx_type);
     assert(max_set_id < IST_SET_SIZE);
-    int ist_buf_filled[IST_INPUT_BUF_SLOTS] = { 0 };
 
     // Primary transform search (stx = 0).
     txfm_param.sec_tx_set_idx = 0;
@@ -2739,7 +2933,8 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
         &ctx, primary_tx_type, 0, set_id_0, &txfm_param, &quant_param,
         skip_trellis, skip_trellis_in, skip_trellis_based_on_satd,
         coeffs_available, &eob_found, &best_rd, best_rd_stats, &best_tx_type,
-        &best_txb_ctx, &best_eob, &best_dqcoeff, &skip_idx, ist_buf_filled);
+        &best_txb_ctx, &best_eob, &best_dqcoeff, &skip_idx, NULL, recon_buf,
+        &cur_recon_idx, &best_recon_idx);
     if (skip_idx) break;
 
     // Only the DCT_DCT primary trial (stx == 0) can set eob_found, so it
@@ -2782,12 +2977,18 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
     // would be pruned by prune_sec_txfm_rd_eval(), so only check it together
     // with that speed feature.
     if (tx_sf->prune_tx_rd_eval_sec_tx_sse && best_rd != INT64_MAX) {
-      const int64_t ist_energy = get_ist_input_energy_bound(x, tx_size, xd->bd);
+      const int64_t ist_energy =
+          get_ist_input_energy_bound(x, block, tx_size, xd->bd);
       if (RDCOST(x->rdmult, 0, AVMMAX(block_sse - ist_energy, 0)) > best_rd)
         continue;
     }
 
     // Secondary transform (IST) search (stx > 0).
+    const int tr_width = AVMMIN(txw, 32);
+    const int tr_height = AVMMIN(txh, 32);
+    memcpy(mb_plane->temp_coeff, mb_plane->coeff + BLOCK_OFFSET(block),
+           tr_width * tr_height * sizeof(tran_low_t));
+    int ist_buf_filled[IST_INPUT_BUF_SLOTS] = { 0 };
     // Lowest RD cost among the IST trials of sets 0 and 1.
     int64_t best_set01_rd = INT64_MAX;
     for (int set_idx = 0; set_idx < max_set_id && !skip_idx; ++set_idx) {
@@ -2807,7 +3008,7 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
             skip_trellis, skip_trellis_in, skip_trellis_based_on_satd,
             coeffs_available, &eob_found, &best_rd, best_rd_stats,
             &best_tx_type, &best_txb_ctx, &best_eob, &best_dqcoeff, &skip_idx,
-            ist_buf_filled);
+            ist_buf_filled, recon_buf, &cur_recon_idx, &best_recon_idx);
         if (set_idx <= 1) best_set01_rd = AVMMIN(best_set01_rd, ist_rd);
       }
       // For intra blocks, skip the remaining IST sets (sets 2 and 3) if the
@@ -2826,6 +3027,9 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
         plane == AVM_PLANE_Y) ||
        best_rd == INT64_MAX) &&
       !is_inter) {
+    if (best_tx_type.primary_tx != DCT_DCT || best_tx_type.sec_tx != 0) {
+      best_recon_idx = -1;
+    }
     best_tx_type = MAKE_TX_TYPE_FROM_PRIMARY_TX_TYPE(DCT_DCT);
   }
 
@@ -2847,9 +3051,13 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
   mb_plane->dqcoeff = best_dqcoeff;
 
   if (calc_pixel_domain_distortion_final && best_eob) {
-    best_rd_stats->dist =
-        dist_block_px_domain(cpi, x, plane, block, blk_row, blk_col, tx_size);
+    best_rd_stats->dist = dist_block_px_domain_fast(
+        cpi, x, plane, block, blk_row, blk_col, tx_size, best_tx_type, is_fsc,
+        is_lossless, ctx.src, ctx.src_stride, ctx.dst, ctx.dst_stride,
+        ctx.visible_rows, ctx.visible_cols, ctx.use_ddt,
+        ctx.reduced_tx_set_used, recon_buf[0]);
     best_rd_stats->sse = block_sse;
+    if (need_recon_intra) best_recon_idx = 0;
   }
 
   if (plane == AVM_PLANE_Y && best_eob == 1 &&
@@ -2861,8 +3069,18 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
   // can use them for prediction. If cctx is enabled, this reconstruction
   // should be done later in search_cctx_type, when cctx type is chosen.
   if (plane == AVM_PLANE_Y || !is_cctx_allowed(cm, xd)) {
-    recon_intra(cpi, x, plane, block, blk_row, blk_col, plane_bsize, tx_size,
-                txb_ctx, skip_trellis, best_tx_type, 0, &rate_cost, best_eob);
+    if (need_recon_intra && best_eob && best_recon_idx >= 0) {
+      avm_highbd_convolve_copy(recon_buf[best_recon_idx], MAX_TX_SIZE, ctx.dst,
+                               ctx.dst_stride, txw, txh);
+      if (best_eob == 1 &&
+          (best_tx_type.primary_tx != DCT_DCT || best_tx_type.sec_tx > 0)) {
+        update_txk_array(xd, blk_row, blk_col, tx_size,
+                         MAKE_TX_TYPE_FROM_PRIMARY_TX_TYPE(DCT_DCT));
+      }
+    } else {
+      recon_intra(cpi, x, plane, block, blk_row, blk_col, plane_bsize, tx_size,
+                  txb_ctx, skip_trellis, best_tx_type, 0, &rate_cost, best_eob);
+    }
     mb_plane->dqcoeff = orig_dqcoeff;
   }
 }

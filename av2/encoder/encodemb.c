@@ -650,7 +650,7 @@ void av2_xform(MACROBLOCK *x, int plane, int block, int blk_row, int blk_col,
   if (reuse == 0 ||
       (txfm_param->sec_tx_type == 0 && txfm_param->sec_tx_set_idx == 0)) {
     av2_fwd_txfm(src_diff, coeff, diff_stride, txfm_param);
-    if (plane == 0) {
+    if (reuse == 0 && plane == 0 && txfm_param->sec_tx_type != 0) {
       memcpy(p->temp_coeff, coeff, tr_width * tr_height * sizeof(tran_low_t));
     }
   }

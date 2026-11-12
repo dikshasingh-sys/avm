@@ -997,6 +997,29 @@ static void av2_highbd_inv_txfm_add_master(const tran_low_t *input,
   av2_highbd_inv_txfm_add(input, dest, stride, txfm_param);
 }
 
+static void av2_inv_stxfm_copy(const tran_low_t *coeff_in,
+                               tran_low_t *coeff_out, TxfmParam *txfm_param);
+
+#if defined(_MSC_VER)
+#define IDCT_NOINLINE __declspec(noinline)
+#else
+#define IDCT_NOINLINE __attribute__((noinline))
+#endif
+
+static IDCT_NOINLINE void av2_inverse_stxfm_and_transform_block(
+    const tran_low_t *dqcoeff, TxfmParam *txfm_param, uint16_t *dst,
+    int stride) {
+  DECLARE_ALIGNED(32, tran_low_t, temp_dqcoeff[MAX_TX_SQUARE]);
+  const int max_eob = av2_get_max_eob(txfm_param->tx_size);
+  const int full_2d = tx_size_2d[txfm_param->tx_size];
+  if (UNLIKELY(full_2d > max_eob)) {
+    memset(temp_dqcoeff + max_eob, 0,
+           (size_t)(full_2d - max_eob) * sizeof(tran_low_t));
+  }
+  av2_inv_stxfm_copy(dqcoeff, temp_dqcoeff, txfm_param);
+  av2_highbd_inv_txfm_add_master(temp_dqcoeff, dst, stride, txfm_param);
+}
+
 void av2_inverse_transform_block(const MACROBLOCKD *xd,
                                  const tran_low_t *dqcoeff, int plane,
                                  TX_TYPE tx_type, TX_SIZE tx_size,
@@ -1014,30 +1037,30 @@ void av2_inverse_transform_block(const MACROBLOCKD *xd,
                  block_signals_sec_tx_type(xd, tx_size, tx_type.primary_tx,
                                            txfm_param.eob)));
 
-  // Work buffer for secondary transform
-  DECLARE_ALIGNED(32, tran_low_t, temp_dqcoeff[MAX_TX_SQUARE]);
-  memcpy(temp_dqcoeff, dqcoeff, sizeof(tran_low_t) * tx_size_2d[tx_size]);
-
-  av2_inv_stxfm(temp_dqcoeff, &txfm_param);
-
   MB_MODE_INFO *const mbmi = xd->mi[0];
-  if (xd->lossless[mbmi->segment_id]) {
+  if (UNLIKELY(xd->lossless[mbmi->segment_id])) {
     PREDICTION_MODE cur_pred_mode =
         (plane == AVM_PLANE_Y) ? mbmi->mode : get_uv_mode(mbmi->uv_mode);
     int cur_dpcm_flag =
         (plane == AVM_PLANE_Y) ? mbmi->use_dpcm_y : mbmi->use_dpcm_uv;
     int cur_angle_delta = (plane == AVM_PLANE_Y) ? mbmi->angle_delta[0] : 0;
     if (cur_pred_mode == V_PRED && cur_angle_delta == 0 && cur_dpcm_flag > 0) {
-      av2_highbd_inv_txfm_add_vert(temp_dqcoeff, dst, stride, &txfm_param);
+      av2_highbd_inv_txfm_add_vert(dqcoeff, dst, stride, &txfm_param);
     } else if (cur_pred_mode == H_PRED && cur_angle_delta == 0 &&
                cur_dpcm_flag > 0) {
-      av2_highbd_inv_txfm_add_horz(temp_dqcoeff, dst, stride, &txfm_param);
+      av2_highbd_inv_txfm_add_horz(dqcoeff, dst, stride, &txfm_param);
     } else {
-      av2_highbd_inv_txfm_add_master(temp_dqcoeff, dst, stride, &txfm_param);
+      av2_highbd_inv_txfm_add_master(dqcoeff, dst, stride, &txfm_param);
     }
-  } else {
-    av2_highbd_inv_txfm_add_master(temp_dqcoeff, dst, stride, &txfm_param);
+    return;
   }
+
+  if (UNLIKELY(txfm_param.sec_tx_type != 0)) {
+    av2_inverse_stxfm_and_transform_block(dqcoeff, &txfm_param, dst, stride);
+    return;
+  }
+
+  av2_highbd_inv_txfm_add_master(dqcoeff, dst, stride, &txfm_param);
 }
 
 // Inverse secondary transform
@@ -1072,7 +1095,8 @@ void inv_stxfm_c(tran_low_t *src, tran_low_t *dst, const PREDICTION_MODE mode,
   }
 }
 
-void av2_inv_stxfm(tran_low_t *coeff, TxfmParam *txfm_param) {
+static void av2_inv_stxfm_copy(const tran_low_t *coeff_in,
+                               tran_low_t *coeff_out, TxfmParam *txfm_param) {
   const SEC_TX_TYPE stx_type = txfm_param->sec_tx_type;
 
   const int width = tx_size_wide[txfm_param->tx_size] <= 32
@@ -1095,14 +1119,11 @@ void av2_inv_stxfm(tran_low_t *coeff, TxfmParam *txfm_param) {
         get_scan(txfm_param->tx_size, txfm_param->primary_tx_type);
     const int16_t *const scan = scan_order_in->scan;
     tran_low_t buf0[64] = { 0 }, buf1[64] = { 0 };
-    tran_low_t *tmp = buf0;
-    tran_low_t *src = coeff;
 
-    int reduced_width = sb_size == 8 ? IST_8x8_WIDTH : IST_4x4_WIDTH;
+    const int reduced_width = sb_size == 8 ? IST_8x8_WIDTH : IST_4x4_WIDTH;
     for (int r = 0; r < reduced_width; r++) {
       // Align scan order of IST with primary transform scan order
-      *tmp = src[scan[r]];
-      tmp++;
+      buf0[r] = coeff_in[scan[r]];
     }
     int8_t transpose = 0;
     mode = AVMMIN(intra_mode, SMOOTH_H_PRED);
@@ -1117,7 +1138,7 @@ void av2_inv_stxfm(tran_low_t *coeff, TxfmParam *txfm_param) {
             transpose, txfm_param->sec_tx_set, stx_type);
     for (int i = 0; i < height; i++) {
       for (int j = 0; j < width; j++) {
-        fprintf(stderr, "%d,", coeff[i * width + j]);
+        fprintf(stderr, "%d,", coeff_in[i * width + j]);
       }
       fprintf(stderr, "\n");
     }
@@ -1141,32 +1162,36 @@ void av2_inv_stxfm(tran_low_t *coeff, TxfmParam *txfm_param) {
             ? (txfm_param->primary_tx_type == DCT_DCT ? 2 : 3)
             : 0;
     inv_stxfm(buf0, buf1, mode_t, stx_type - 1, st_size_class, txfm_param->bd);
-    tmp = buf1;
-    src = coeff;
-    memset(src, 0, width * height * sizeof(tran_low_t));
+    memset(coeff_out, 0, width * height * sizeof(tran_low_t));
     // coeff8x8_mapping holds only the distinct orderings; coeff8x8_mapping_idx
     // selects the one this (set, stx_type) pair uses.
-    const int16_t *sup_reg_mapping =
-        sb_size == 8
-            ? coeff8x8_mapping[coeff8x8_mapping_idx[txfm_param->sec_tx_set *
-                                                        (STX_TYPES - 1) +
-                                                    (stx_type - 1)]]
-            : NULL;
-    for (int r = 0; r < reduced_width; r++) {
-      if (sb_size == 8)
-        src[scan_order_out[sup_reg_mapping[r]]] = *tmp;
-      else
-        src[scan_order_out[r]] = *tmp;
-      tmp++;
+    if (sb_size == 8) {
+      const int16_t *sup_reg_mapping =
+          coeff8x8_mapping[coeff8x8_mapping_idx[txfm_param->sec_tx_set *
+                                                    (STX_TYPES - 1) +
+                                                (stx_type - 1)]];
+      for (int r = 0; r < reduced_width; r++) {
+        coeff_out[scan_order_out[sup_reg_mapping[r]]] = buf1[r];
+      }
+    } else {
+      for (int r = 0; r < reduced_width; r++) {
+        coeff_out[scan_order_out[r]] = buf1[r];
+      }
     }
 #if STX_COEFF_DEBUG
     fprintf(stderr, "(ptx coeff)\n");
     for (int i = 0; i < height; i++) {
       for (int j = 0; j < width; j++) {
-        fprintf(stderr, "%d,", coeff[i * width + j]);
+        fprintf(stderr, "%d,", coeff_out[i * width + j]);
       }
       fprintf(stderr, "\n");
     }
 #endif  // STX_COEFF_DEBUG
+  } else if (coeff_out != coeff_in) {
+    memcpy(coeff_out, coeff_in, width * height * sizeof(tran_low_t));
   }
+}
+
+void av2_inv_stxfm(tran_low_t *coeff, TxfmParam *txfm_param) {
+  av2_inv_stxfm_copy(coeff, coeff, txfm_param);
 }

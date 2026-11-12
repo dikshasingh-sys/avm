@@ -1644,8 +1644,6 @@ static AVM_FORCE_INLINE int warehouse_efficients_txb(
     cost = coeff_costs->txb_skip_cost[pred_mode_ctx][txb_skip_ctx][0];
   }
 
-  av2_txb_init_levels(qcoeff, width, height, levels);
-
   const int bob_code = p->bobs[block];
   const int is_inter = is_inter_block(xd->mi[0], xd->tree_type);
   const int is_fsc = ((cm->seq_params.enable_fsc &&
@@ -1658,8 +1656,25 @@ static AVM_FORCE_INLINE int warehouse_efficients_txb(
   cost += get_cctx_type_cost(cm, x, xd, plane, tx_size, block, cctx_type);
   cost += get_eob_cost(eob, eob_costs, coeff_costs, is_inter, tx_size);
 
-  av2_get_nz_map_contexts(levels, scan, eob, tx_size, tx_class, coeff_contexts,
-                          plane);
+  if (eob == 1) {
+    coeff_contexts[0] = 0;
+  } else {
+    int active_height = height;
+    if (tx_class == TX_CLASS_2D) {
+      if (eob <= 10) {
+        active_height = AVMMIN(height, 4);
+      } else if (eob <= 36 && width >= 8 && height >= 8) {
+        active_height = AVMMIN(height, 8);
+      } else if (eob <= 136 && width >= 16 && height >= 16) {
+        active_height = AVMMIN(height, 16);
+      }
+    } else if (tx_class == TX_CLASS_VERT) {
+      active_height = AVMMIN(height, (((eob - 1) >> bwl) + 4) & ~3);
+    }
+    av2_txb_init_levels(qcoeff, width, active_height, levels);
+    av2_get_nz_map_contexts(levels, scan, eob, tx_size, tx_class,
+                            coeff_contexts, plane);
+  }
 
   const int(*lps_cost)[COEFF_BASE_RANGE + 1 + COEFF_BASE_RANGE + 1] =
       coeff_costs->lps_cost;
@@ -1754,89 +1769,143 @@ static AVM_FORCE_INLINE int warehouse_efficients_txb(
       coeff_costs->base_lf_cost_uv;
   const int(*base_cost_uv)[8] = coeff_costs->base_cost_uv;
 
+  int num_nz = (qcoeff[scan[eob - 1]] != 0);
   int hr_level_avg = hr_level >> 1;
-  for (c = eob - 2; c >= 1; --c) {
-    const int pos = scan[c];
-    const int coeff_ctx = coeff_contexts[pos];
-    const tran_low_t v = qcoeff[pos];
-    const int level = abs(v);
-    const int row = pos >> bwl;
-    const int col = pos - (row << bwl);
-    int limits = get_lf_limits(row, col, tx_class, plane);
-    if (plane > 0) {
-      if (limits) {
-        cost += base_lf_cost_uv[coeff_ctx][AVMMIN(level, LF_BASE_SYMBOLS - 1)];
-      } else {
-        cost += base_cost_uv[coeff_ctx][AVMMIN(level, 3)];
+  if (plane == 0 && tx_class == TX_CLASS_2D) {
+    for (c = eob - 2; c >= 10; --c) {
+      const int pos = scan[c];
+      const int coeff_ctx = coeff_contexts[pos];
+      const tran_low_t v = qcoeff[pos];
+      if (!v) {
+        cost += base_cost[coeff_ctx][0][0];
+        continue;
       }
-    } else {
-      if (limits) {
-        cost += base_lf_cost[coeff_ctx][0][AVMMIN(level, LF_BASE_SYMBOLS - 1)];
-      } else {
-        cost += base_cost[coeff_ctx][0][AVMMIN(level, 3)];
+      num_nz++;
+      const int level = abs(v);
+      cost += base_cost[coeff_ctx][0][AVMMIN(level, 3)] + av2_cost_literal(1);
+      if (level > NUM_BASE_LEVELS) {
+        const int ctx = get_br_ctx_2d(levels, pos, bwl);
+        cost += get_br_cost(level, lps_cost[ctx], hr_level_avg, &hr_level);
+        hr_level_avg = (hr_level_avg + hr_level) >> 1;
       }
     }
-    if (v) {
-      // sign bit cost
-      const bool dc_2dtx = (c == 0);
-      const bool dc_hor = (col == 0) && tx_class == TX_CLASS_HORIZ;
-      const bool dc_ver = (row == 0) && tx_class == TX_CLASS_VERT;
-      if (dc_2dtx || dc_hor || dc_ver) {
-        const int dc_ph_group = 0;  // PH disabled
-        const int dc_sign_ctx = dc_2dtx ? txb_ctx->dc_sign_ctx : 0;
-        const int sign = AVMSIGN(v);
-        const int sign01 = (sign ^ sign) - sign;
-        if (plane == AVM_PLANE_V) {
-          cost += coeff_costs
-                      ->v_dc_sign_cost[xd->tmp_sign[pos]][dc_sign_ctx][sign01];
-        } else {
-          cost += coeff_costs->dc_sign_cost[dc_ph_group][dc_sign_ctx][sign01];
-        }
-      } else {
-        cost += av2_cost_literal(1);
+    for (c = AVMMIN(eob - 2, 9); c >= 1; --c) {
+      const int pos = scan[c];
+      const int coeff_ctx = coeff_contexts[pos];
+      const tran_low_t v = qcoeff[pos];
+      if (!v) {
+        cost += base_lf_cost[coeff_ctx][0][0];
+        continue;
       }
+      num_nz++;
+      const int level = abs(v);
+      cost += base_lf_cost[coeff_ctx][0][AVMMIN(level, LF_BASE_SYMBOLS - 1)] +
+              av2_cost_literal(1);
+      if (level > LF_NUM_BASE_LEVELS) {
+        const int ctx = get_br_lf_ctx_2d(levels, pos, bwl);
+        cost +=
+            get_br_lf_cost(level, lps_lf_cost[ctx], hr_level_avg, &hr_level);
+        hr_level_avg = (hr_level_avg + hr_level) >> 1;
+      }
+    }
+  } else if (plane > 0 && tx_class == TX_CLASS_2D) {
+    for (c = eob - 2; c >= 1; --c) {
+      const int pos = scan[c];
+      const int coeff_ctx = coeff_contexts[pos];
+      const tran_low_t v = qcoeff[pos];
+      if (!v) {
+        cost += base_cost_uv[coeff_ctx][0];
+        continue;
+      }
+      const int level = abs(v);
+      cost += base_cost_uv[coeff_ctx][AVMMIN(level, 3)] + av2_cost_literal(1);
+      if (level > NUM_BASE_LEVELS) {
+        const int ctx = get_br_ctx_2d_chroma(levels, pos, bwl);
+        cost += get_br_cost(level, lps_cost_uv[ctx], hr_level_avg, &hr_level);
+        hr_level_avg = (hr_level_avg + hr_level) >> 1;
+      }
+    }
+  } else {
+    for (c = eob - 2; c >= 1; --c) {
+      const int pos = scan[c];
+      const int coeff_ctx = coeff_contexts[pos];
+      const tran_low_t v = qcoeff[pos];
+      const int level = abs(v);
+      const int row = pos >> bwl;
+      const int col = pos - (row << bwl);
+      int limits = get_lf_limits(row, col, tx_class, plane);
       if (plane > 0) {
         if (limits) {
-          if (level > LF_NUM_BASE_LEVELS) {
-            cost += get_br_lf_cost_uv(level, hr_level_avg, &hr_level);
-            hr_level_avg = (hr_level_avg + hr_level) >> 1;
-          }
+          cost +=
+              base_lf_cost_uv[coeff_ctx][AVMMIN(level, LF_BASE_SYMBOLS - 1)];
         } else {
-          if (level > NUM_BASE_LEVELS) {
-            const int ctx = get_br_ctx_chroma(levels, pos, bwl, tx_class);
-            cost +=
-                get_br_cost(level, lps_cost_uv[ctx], hr_level_avg, &hr_level);
-            hr_level_avg = (hr_level_avg + hr_level) >> 1;
-          }
+          cost += base_cost_uv[coeff_ctx][AVMMIN(level, 3)];
         }
       } else {
         if (limits) {
-          if (level > LF_NUM_BASE_LEVELS) {
-            const int ctx = get_br_lf_ctx(levels, pos, bwl, tx_class);
-            cost += get_br_lf_cost(level, lps_lf_cost[ctx], hr_level_avg,
-                                   &hr_level);
-            hr_level_avg = (hr_level_avg + hr_level) >> 1;
+          cost +=
+              base_lf_cost[coeff_ctx][0][AVMMIN(level, LF_BASE_SYMBOLS - 1)];
+        } else {
+          cost += base_cost[coeff_ctx][0][AVMMIN(level, 3)];
+        }
+      }
+      if (v) {
+        num_nz++;
+        // sign bit cost
+        const bool dc_2dtx = (c == 0);
+        const bool dc_hor = (col == 0) && tx_class == TX_CLASS_HORIZ;
+        const bool dc_ver = (row == 0) && tx_class == TX_CLASS_VERT;
+        if (dc_2dtx || dc_hor || dc_ver) {
+          const int dc_ph_group = 0;  // PH disabled
+          const int dc_sign_ctx = dc_2dtx ? txb_ctx->dc_sign_ctx : 0;
+          const int sign = AVMSIGN(v);
+          const int sign01 = (sign ^ sign) - sign;
+          if (plane == AVM_PLANE_V) {
+            cost +=
+                coeff_costs
+                    ->v_dc_sign_cost[xd->tmp_sign[pos]][dc_sign_ctx][sign01];
+          } else {
+            cost += coeff_costs->dc_sign_cost[dc_ph_group][dc_sign_ctx][sign01];
           }
         } else {
-          if (level > NUM_BASE_LEVELS) {
-            const int ctx = get_br_ctx(levels, pos, bwl, tx_class);
-            cost += get_br_cost(level, lps_cost[ctx], hr_level_avg, &hr_level);
-            hr_level_avg = (hr_level_avg + hr_level) >> 1;
+          cost += av2_cost_literal(1);
+        }
+        if (plane > 0) {
+          if (limits) {
+            if (level > LF_NUM_BASE_LEVELS) {
+              cost += get_br_lf_cost_uv(level, hr_level_avg, &hr_level);
+              hr_level_avg = (hr_level_avg + hr_level) >> 1;
+            }
+          } else {
+            if (level > NUM_BASE_LEVELS) {
+              const int ctx = get_br_ctx_chroma(levels, pos, bwl, tx_class);
+              cost +=
+                  get_br_cost(level, lps_cost_uv[ctx], hr_level_avg, &hr_level);
+              hr_level_avg = (hr_level_avg + hr_level) >> 1;
+            }
+          }
+        } else {
+          if (limits) {
+            if (level > LF_NUM_BASE_LEVELS) {
+              const int ctx = get_br_lf_ctx(levels, pos, bwl, tx_class);
+              cost += get_br_lf_cost(level, lps_lf_cost[ctx], hr_level_avg,
+                                     &hr_level);
+              hr_level_avg = (hr_level_avg + hr_level) >> 1;
+            }
+          } else {
+            if (level > NUM_BASE_LEVELS) {
+              const int ctx = get_br_ctx(levels, pos, bwl, tx_class);
+              cost +=
+                  get_br_cost(level, lps_cost[ctx], hr_level_avg, &hr_level);
+              hr_level_avg = (hr_level_avg + hr_level) >> 1;
+            }
           }
         }
       }
     }
   }
   // c == 0 after previous loop
-  int num_nz = 0;
   hr_level_avg = 0;
-  // num_nz is only needed to decide whether parity hiding applies.
-  if (enable_parity_hiding) {
-    for (c = eob - 1; c > 0; --c) {
-      const int pos = scan[c];
-      num_nz += !!qcoeff[pos];
-    }
-  }
   c = 0;
   if (num_nz >= PHTHRESH && enable_parity_hiding) {
     const int pos = scan[c];
@@ -3396,7 +3465,21 @@ int av2_optimize_txb_new(const struct AV2_COMP *cpi, MACROBLOCK *x, int plane,
   uint8_t levels_buf[TX_PAD_2D];
   uint8_t *const levels = set_levels(levels_buf, width);
 
-  if (eob > 1) av2_txb_init_levels(qcoeff, width, height, levels);
+  if (eob > 1) {
+    int active_height = height;
+    if (tx_class == TX_CLASS_2D) {
+      if (eob <= 10) {
+        active_height = AVMMIN(height, 4);
+      } else if (eob <= 36 && width >= 8 && height >= 8) {
+        active_height = AVMMIN(height, 8);
+      } else if (eob <= 136 && width >= 16 && height >= 16) {
+        active_height = AVMMIN(height, 16);
+      }
+    } else if (tx_class == TX_CLASS_VERT) {
+      active_height = AVMMIN(height, (((eob - 1) >> bwl) + 4) & ~3);
+    }
+    av2_txb_init_levels(qcoeff, width, active_height, levels);
+  }
 
   int txb_skip_ctx = txb_ctx->txb_skip_ctx;
   int non_skip_cost = 0;

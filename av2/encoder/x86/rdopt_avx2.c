@@ -76,34 +76,44 @@ void av2_get_horver_correlation_full_avx2(const int16_t *diff, int stride,
   // Process horizontal and vertical correlations through the body in 4x4
   // blocks.  This excludes the final row and column and possibly one extra
   // column depending how 3 divides into width and height
-  int32_t xy_xz_tmp[8] = { 0 }, x_x2_tmp[8] = { 0 };
-  __m256i xy_sum_32 = _mm256_setzero_si256();
-  __m256i xz_sum_32 = _mm256_setzero_si256();
-  __m256i x_sum_32 = _mm256_setzero_si256();
-  __m256i x2_sum_32 = _mm256_setzero_si256();
+  __m256i acc_xy_xz_lo = _mm256_setzero_si256();
+  __m256i acc_xy_xz_hi = _mm256_setzero_si256();
+  __m256i acc_x_x2_lo = _mm256_setzero_si256();
+  __m256i acc_x_x2_hi = _mm256_setzero_si256();
   for (int i = 0; i <= height - 4; i += 3) {
+    __m256i xy_sum_32 = _mm256_setzero_si256();
+    __m256i xz_sum_32 = _mm256_setzero_si256();
+    __m256i x_sum_32 = _mm256_setzero_si256();
+    __m256i x2_sum_32 = _mm256_setzero_si256();
     for (int j = 0; j <= width - 4; j += 3) {
       horver_correlation_4x4(&diff[i * stride + j], stride, &xy_sum_32,
                              &xz_sum_32, &x_sum_32, &x2_sum_32);
     }
     const __m256i hadd_xy_xz = _mm256_hadd_epi32(xy_sum_32, xz_sum_32);
-    // hadd_xy_xz = [ae+bf+cg ei+fj+gk ab+bc+cd ef+fg+gh]
-    //              [im+jn+ko mm+nn+oo ij+jk+kl mn+no+op] as i32
-    yy_storeu_256(xy_xz_tmp, hadd_xy_xz);
-    xy_sum += (int64_t)xy_xz_tmp[5] + xy_xz_tmp[4] + xy_xz_tmp[1];
-    xz_sum += (int64_t)xy_xz_tmp[7] + xy_xz_tmp[6] + xy_xz_tmp[3];
+    acc_xy_xz_lo = _mm256_add_epi64(
+        acc_xy_xz_lo,
+        _mm256_cvtepi32_epi64(_mm256_castsi256_si128(hadd_xy_xz)));
+    acc_xy_xz_hi = _mm256_add_epi64(
+        acc_xy_xz_hi,
+        _mm256_cvtepi32_epi64(_mm256_extracti128_si256(hadd_xy_xz, 1)));
 
     const __m256i hadd_x_x2 = _mm256_hadd_epi32(x_sum_32, x2_sum_32);
-    // hadd_x_x2 = [aa+bb+cc ee+ff+gg a+b+c e+f+g]
-    //             [ii+jj+kk mm+nn+oo i+j+k m+n+o] as i32
-    yy_storeu_256(x_x2_tmp, hadd_x_x2);
-    x_sum += (int64_t)x_x2_tmp[5] + x_x2_tmp[4] + x_x2_tmp[1];
-    x2_sum += (int64_t)x_x2_tmp[7] + x_x2_tmp[6] + x_x2_tmp[3];
-
-    xy_sum_32 = _mm256_setzero_si256();
-    xz_sum_32 = _mm256_setzero_si256();
-    x_sum_32 = _mm256_setzero_si256();
-    x2_sum_32 = _mm256_setzero_si256();
+    acc_x_x2_lo = _mm256_add_epi64(
+        acc_x_x2_lo, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(hadd_x_x2)));
+    acc_x_x2_hi = _mm256_add_epi64(
+        acc_x_x2_hi,
+        _mm256_cvtepi32_epi64(_mm256_extracti128_si256(hadd_x_x2, 1)));
+  }
+  {
+    int64_t tmp_lo[4], tmp_hi[4];
+    yy_storeu_256(tmp_lo, acc_xy_xz_lo);
+    yy_storeu_256(tmp_hi, acc_xy_xz_hi);
+    xy_sum = tmp_hi[1] + tmp_hi[0] + tmp_lo[1];
+    xz_sum = tmp_hi[3] + tmp_hi[2] + tmp_lo[3];
+    yy_storeu_256(tmp_lo, acc_x_x2_lo);
+    yy_storeu_256(tmp_hi, acc_x_x2_hi);
+    x_sum = tmp_hi[1] + tmp_hi[0] + tmp_lo[1];
+    x2_sum = tmp_hi[3] + tmp_hi[2] + tmp_lo[3];
   }
 
   // x_sum now covers every pixel except the final 1-2 rows and 1-2 cols
@@ -211,9 +221,31 @@ void av2_get_horver_correlation_full_avx2(const int16_t *diff, int stride,
   int64_t x_firstrow = 0, x_firstcol = 0;
   int64_t x2_firstrow = 0, x2_firstcol = 0;
 
-  for (int j = 0; j < width; ++j) {
-    x_firstrow += diff[j];
-    x2_firstrow += diff[j] * diff[j];
+  if (width >= 8) {
+    __m256i v_x = _mm256_setzero_si256();
+    __m256i v_x2 = _mm256_setzero_si256();
+    for (int j = 0; j < width; j += 8) {
+      const __m128i d16 = _mm_loadu_si128((const __m128i *)&diff[j]);
+      const __m256i d32 = _mm256_cvtepi16_epi32(d16);
+      v_x = _mm256_add_epi32(v_x, d32);
+      v_x2 = _mm256_add_epi64(v_x2,
+                              _mm256_cvtepu32_epi64(_mm_madd_epi16(d16, d16)));
+    }
+    const __m128i x128 = _mm_add_epi32(_mm256_castsi256_si128(v_x),
+                                       _mm256_extracti128_si256(v_x, 1));
+    const __m128i x64 = _mm_add_epi32(x128, _mm_srli_si128(x128, 8));
+    const __m128i x32 = _mm_add_epi32(x64, _mm_srli_si128(x64, 4));
+    x_firstrow = (int64_t)_mm_cvtsi128_si32(x32);
+    const __m128i x2_128 = _mm_add_epi64(_mm256_castsi256_si128(v_x2),
+                                         _mm256_extracti128_si256(v_x2, 1));
+    int64_t x2_tmp[2];
+    _mm_storeu_si128((__m128i *)x2_tmp, x2_128);
+    x2_firstrow = x2_tmp[0] + x2_tmp[1];
+  } else {
+    for (int j = 0; j < width; ++j) {
+      x_firstrow += diff[j];
+      x2_firstrow += diff[j] * diff[j];
+    }
   }
   for (int i = 0; i < height; ++i) {
     x_firstcol += diff[i * stride];

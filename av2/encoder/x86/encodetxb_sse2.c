@@ -205,10 +205,9 @@ static INLINE void get_8_coeff_contexts_2d(const uint8_t *levels,
   } while (row);
 }
 
-static INLINE void get_16n_coeff_contexts_2d(const uint8_t *levels,
-                                             const int width, const int height,
-                                             const ptrdiff_t *const offsets,
-                                             int8_t *coeff_contexts) {
+static INLINE void get_16n_coeff_contexts_2d(
+    const uint8_t *levels, const int width, const int active_width,
+    const int height, const ptrdiff_t *const offsets, int8_t *coeff_contexts) {
   const int stride = width + TX_PAD_HOR;
   int8_t *cc = coeff_contexts;
   int row = height;
@@ -248,39 +247,66 @@ static INLINE void get_16n_coeff_contexts_2d(const uint8_t *levels,
   const __m128i pos_to_clip2_large = _mm_set1_epi8(4);
 
   assert(!(width % 16));
+  assert(active_width == 16 || active_width == width);
 
-  do {
-    int w = width;
-
+  if (active_width == 16) {
     do {
       load_levels_16x1x5_sse2(levels, stride, offsets, level);
       count = get_coeff_contexts_2d_kernel_sse2(level, pos_to_clip1[0],
                                                 pos_to_clip2[0]);
       count = _mm_add_epi8(count, pos_to_offset[0]);
       _mm_store_si128((__m128i *)cc, count);
-      levels += 16;
-      cc += 16;
-      w -= 16;
-      pos_to_offset[0] = pos_to_offset_large;
-      pos_to_clip1[0] = pos_to_clip1_large;
-      pos_to_clip2[0] = pos_to_clip2_large;
-    } while (w);
-    levels += TX_PAD_HOR;
-    pos_to_offset[0] = pos_to_offset[1];
-    pos_to_offset[1] = pos_to_offset[2];
-    pos_to_offset[2] = pos_to_offset[3];
-    pos_to_offset[3] = pos_to_offset[4];
-    pos_to_offset[4] = pos_to_offset[5];
-    pos_to_offset[5] = pos_to_offset[6];
-    pos_to_offset[6] = pos_to_offset[7];
-    pos_to_offset[7] = pos_to_offset_large;
-    pos_to_clip1[0] = pos_to_clip1[1];
-    pos_to_clip1[1] = pos_to_clip1[2];
-    pos_to_clip1[2] = pos_to_clip1[3];
-    pos_to_clip1[3] = pos_to_clip1_large;
-    pos_to_clip2[0] = pos_to_clip2[1];
-    pos_to_clip2[1] = pos_to_clip2_large;
-  } while (--row);
+      levels += stride;
+      cc += width;
+      pos_to_offset[0] = pos_to_offset[1];
+      pos_to_offset[1] = pos_to_offset[2];
+      pos_to_offset[2] = pos_to_offset[3];
+      pos_to_offset[3] = pos_to_offset[4];
+      pos_to_offset[4] = pos_to_offset[5];
+      pos_to_offset[5] = pos_to_offset[6];
+      pos_to_offset[6] = pos_to_offset[7];
+      pos_to_offset[7] = pos_to_offset_large;
+      pos_to_clip1[0] = pos_to_clip1[1];
+      pos_to_clip1[1] = pos_to_clip1[2];
+      pos_to_clip1[2] = pos_to_clip1[3];
+      pos_to_clip1[3] = pos_to_clip1_large;
+      pos_to_clip2[0] = pos_to_clip2[1];
+      pos_to_clip2[1] = pos_to_clip2_large;
+    } while (--row);
+  } else {
+    do {
+      int w = width;
+
+      do {
+        load_levels_16x1x5_sse2(levels, stride, offsets, level);
+        count = get_coeff_contexts_2d_kernel_sse2(level, pos_to_clip1[0],
+                                                  pos_to_clip2[0]);
+        count = _mm_add_epi8(count, pos_to_offset[0]);
+        _mm_store_si128((__m128i *)cc, count);
+        levels += 16;
+        cc += 16;
+        w -= 16;
+        pos_to_offset[0] = pos_to_offset_large;
+        pos_to_clip1[0] = pos_to_clip1_large;
+        pos_to_clip2[0] = pos_to_clip2_large;
+      } while (w);
+      levels += TX_PAD_HOR;
+      pos_to_offset[0] = pos_to_offset[1];
+      pos_to_offset[1] = pos_to_offset[2];
+      pos_to_offset[2] = pos_to_offset[3];
+      pos_to_offset[3] = pos_to_offset[4];
+      pos_to_offset[4] = pos_to_offset[5];
+      pos_to_offset[5] = pos_to_offset[6];
+      pos_to_offset[6] = pos_to_offset[7];
+      pos_to_offset[7] = pos_to_offset_large;
+      pos_to_clip1[0] = pos_to_clip1[1];
+      pos_to_clip1[1] = pos_to_clip1[2];
+      pos_to_clip1[2] = pos_to_clip1[3];
+      pos_to_clip1[3] = pos_to_clip1_large;
+      pos_to_clip2[0] = pos_to_clip2[1];
+      pos_to_clip2[1] = pos_to_clip2_large;
+    } while (--row);
+  }
 }
 
 static INLINE __m128i get_coeff_contexts_1d_kernel_sse2(__m128i *const level,
@@ -613,11 +639,9 @@ static INLINE void get_8_coeff_contexts_2d_chroma(const uint8_t *levels,
   } while (row);
 }
 
-static INLINE void get_16n_coeff_contexts_2d_chroma(const uint8_t *levels,
-                                                    const int width,
-                                                    const int height,
-                                                    int8_t *coeff_contexts,
-                                                    const int plane) {
+static INLINE void get_16n_coeff_contexts_2d_chroma(
+    const uint8_t *levels, const int width, const int active_width,
+    const int height, int8_t *coeff_contexts, const int plane) {
   const int stride = width + TX_PAD_HOR;
   const __m128i pos_to_offset =
       (plane == AVM_PLANE_U) ? _mm_set1_epi8(0) : _mm_set1_epi8(4);
@@ -630,22 +654,35 @@ static INLINE void get_16n_coeff_contexts_2d_chroma(const uint8_t *levels,
   __m128i level[3];
 
   assert(!(width % 16));
+  assert(active_width == 16 || active_width == width);
 
-  do {
-    int w = width;
-
+  if (active_width == 16) {
     do {
       load_levels_16x1x3_sse2(levels, stride, level);
       count = get_coeff_contexts_2d_kernel_chroma_sse2(level, pos_to_clip);
       count = _mm_add_epi8(count, pos_to_offset);
       _mm_store_si128((__m128i *)cc, count);
       pos_to_clip = pos_to_clip_large;
-      levels += 16;
-      cc += 16;
-      w -= 16;
-    } while (w);
-    levels += TX_PAD_HOR;
-  } while (--row);
+      levels += stride;
+      cc += width;
+    } while (--row);
+  } else {
+    do {
+      int w = width;
+
+      do {
+        load_levels_16x1x3_sse2(levels, stride, level);
+        count = get_coeff_contexts_2d_kernel_chroma_sse2(level, pos_to_clip);
+        count = _mm_add_epi8(count, pos_to_offset);
+        _mm_store_si128((__m128i *)cc, count);
+        pos_to_clip = pos_to_clip_large;
+        levels += 16;
+        cc += 16;
+        w -= 16;
+      } while (w);
+      levels += TX_PAD_HOR;
+    } while (--row);
+  }
 }
 
 static INLINE __m128i
@@ -845,11 +882,29 @@ void av2_get_nz_map_contexts_sse2(const uint8_t *const levels,
     coeff_contexts[0] = 0;
     return;
   }
+  const int bwl = get_txb_bwl(tx_size);
   const int width = get_txb_wide(tx_size);
   const int height = get_txb_high(tx_size);
   const int stride = width + TX_PAD_HOR;
   /* coeff_contexts must be 16 byte aligned. */
   assert(!((intptr_t)coeff_contexts & 0xf));
+
+  int active_height = height;
+  int active_width = width;
+  if (tx_class == TX_CLASS_2D) {
+    if (eob <= 10) {
+      active_height = AVMMIN(height, 4);
+      active_width = AVMMIN(width, 16);
+    } else if (eob <= 36 && width >= 8 && height >= 8) {
+      active_height = AVMMIN(height, 8);
+      active_width = AVMMIN(width, 16);
+    } else if (eob <= 136 && width >= 16 && height >= 16) {
+      active_height = AVMMIN(height, 16);
+      active_width = AVMMIN(width, 16);
+    }
+  } else if (tx_class == TX_CLASS_VERT) {
+    active_height = AVMMIN(height, ((last_idx >> bwl) + 4) & ~3);
+  }
 
   if (plane == 0) {
     ptrdiff_t offsets[3];
@@ -860,12 +915,13 @@ void av2_get_nz_map_contexts_sse2(const uint8_t *const levels,
       offsets[2] = 2 * stride + 0;
 
       if (width == 4) {
-        get_4_nz_map_contexts_2d(levels, height, offsets, coeff_contexts);
+        get_4_nz_map_contexts_2d(levels, active_height, offsets,
+                                 coeff_contexts);
       } else if (width == 8) {
-        get_8_coeff_contexts_2d(levels, height, offsets, coeff_contexts);
+        get_8_coeff_contexts_2d(levels, active_height, offsets, coeff_contexts);
       } else {
-        get_16n_coeff_contexts_2d(levels, width, height, offsets,
-                                  coeff_contexts);
+        get_16n_coeff_contexts_2d(levels, width, active_width, active_height,
+                                  offsets, coeff_contexts);
       }
     } else if (tx_class == TX_CLASS_HORIZ) {
       offsets[0] = 2;
@@ -884,23 +940,27 @@ void av2_get_nz_map_contexts_sse2(const uint8_t *const levels,
       offsets[1] = 3 * stride;
       offsets[2] = 4 * stride;
       if (width == 4) {
-        get_4_nz_map_contexts_ver(levels, height, offsets, coeff_contexts);
+        get_4_nz_map_contexts_ver(levels, active_height, offsets,
+                                  coeff_contexts);
       } else if (width == 8) {
-        get_8_coeff_contexts_ver(levels, height, offsets, coeff_contexts);
+        get_8_coeff_contexts_ver(levels, active_height, offsets,
+                                 coeff_contexts);
       } else {
-        get_16n_coeff_contexts_ver(levels, width, height, offsets,
+        get_16n_coeff_contexts_ver(levels, width, active_height, offsets,
                                    coeff_contexts);
       }
     }
   } else {
     if (tx_class == TX_CLASS_2D) {
       if (width == 4) {
-        get_4_nz_map_contexts_2d_chroma(levels, height, coeff_contexts, plane);
+        get_4_nz_map_contexts_2d_chroma(levels, active_height, coeff_contexts,
+                                        plane);
       } else if (width == 8) {
-        get_8_coeff_contexts_2d_chroma(levels, height, coeff_contexts, plane);
+        get_8_coeff_contexts_2d_chroma(levels, active_height, coeff_contexts,
+                                       plane);
       } else {
-        get_16n_coeff_contexts_2d_chroma(levels, width, height, coeff_contexts,
-                                         plane);
+        get_16n_coeff_contexts_2d_chroma(levels, width, active_width,
+                                         active_height, coeff_contexts, plane);
       }
     } else if (tx_class == TX_CLASS_HORIZ) {
       if (width == 4) {
@@ -913,16 +973,15 @@ void av2_get_nz_map_contexts_sse2(const uint8_t *const levels,
       }
     } else {  // TX_CLASS_VERT
       if (width == 4) {
-        get_4_nz_map_contexts_ver_chroma(levels, height, coeff_contexts);
+        get_4_nz_map_contexts_ver_chroma(levels, active_height, coeff_contexts);
       } else if (width == 8) {
-        get_8_coeff_contexts_ver_chroma(levels, height, coeff_contexts);
+        get_8_coeff_contexts_ver_chroma(levels, active_height, coeff_contexts);
       } else {
-        get_16n_coeff_contexts_ver_chroma(levels, width, height,
+        get_16n_coeff_contexts_ver_chroma(levels, width, active_height,
                                           coeff_contexts);
       }
     }
   }
-  const int bwl = get_txb_bwl(tx_size);
   const int pos = scan[last_idx];
   if (last_idx <= (height << bwl) / 8)
     coeff_contexts[pos] = 1;
