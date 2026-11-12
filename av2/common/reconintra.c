@@ -805,6 +805,42 @@ void av2_highbd_dr_prediction_z3_idif_c(uint16_t *dst, ptrdiff_t stride, int bw,
   }
 }
 
+static AVM_FORCE_INLINE void highbd_pad_intra_edge_8(uint16_t *edge_dst,
+                                                     uint16_t pad_val) {
+  const uint64_t packed_pad = (uint64_t)pad_val * 0x0001000100010001ULL;
+  memcpy(edge_dst, &packed_pad, sizeof(packed_pad));
+  memcpy(edge_dst + 4, &packed_pad, sizeof(packed_pad));
+}
+
+static AVM_FORCE_INLINE void highbd_pad_intra_edge_17(uint16_t *edge_dst,
+                                                      uint16_t pad_val) {
+  const uint64_t packed_pad = (uint64_t)pad_val * 0x0001000100010001ULL;
+  memcpy(edge_dst, &packed_pad, sizeof(packed_pad));
+  memcpy(edge_dst + 4, &packed_pad, sizeof(packed_pad));
+  memcpy(edge_dst + 8, &packed_pad, sizeof(packed_pad));
+  memcpy(edge_dst + 12, &packed_pad, sizeof(packed_pad));
+  edge_dst[16] = pad_val;
+}
+
+static AVM_FORCE_INLINE void highbd_average_mrl_pred(
+    uint16_t *dst, int dst_stride, const uint16_t *mrl_line0_pred, int block_w,
+    int block_h) {
+  assert((block_w & 3) == 0);
+  for (int row = 0; row < block_h; ++row) {
+    for (int col = 0; col < block_w; col += 4) {
+      uint64_t primary_quad, line0_quad;
+      memcpy(&primary_quad, dst + col, sizeof(primary_quad));
+      memcpy(&line0_quad, mrl_line0_pred + col, sizeof(line0_quad));
+      const uint64_t avg_quad =
+          (primary_quad | line0_quad) -
+          (((primary_quad ^ line0_quad) >> 1) & 0x7fff7fff7fff7fffULL);
+      memcpy(dst + col, &avg_quad, sizeof(avg_quad));
+    }
+    dst += dst_stride;
+    mrl_line0_pred += block_w;
+  }
+}
+
 static void highbd_dr_predictor_idif(uint16_t *dst, ptrdiff_t stride,
                                      TX_SIZE tx_size, uint16_t *above,
                                      uint16_t *left, int angle, int bd,
@@ -816,33 +852,27 @@ static void highbd_dr_predictor_idif(uint16_t *dst, ptrdiff_t stride,
   assert(angle > 0 && angle < 270);
 
   const int max_base_z1_z3 = (bw + bh) - 1 + (mrl_index << 1);
-  const int max_base_z2_above = bw - 1;
-  const int max_base_z2_left = bh - 1;
   const int min_base_z2 = -(1 + mrl_index);
 
   if (angle > 0 && angle < 90) {
-    // SIMD kernels load up to 10 past max_base (lanes later masked out).
-    for (int i = 1; i <= 10; ++i)
-      above[max_base_z1_z3 + i] = above[max_base_z1_z3];
+    // SIMD kernels load up to 17 past max_base (lanes later masked out).
+    highbd_pad_intra_edge_17(&above[max_base_z1_z3 + 1], above[max_base_z1_z3]);
     av2_highbd_dr_prediction_z1_idif(dst, stride, bw, bh, above, left, dx, dy,
                                      bd, mrl_index);
 
   } else if (angle > 90 && angle < 180) {
     // SIMD kernels load down to min_base - 8 (lanes later masked out).
-    for (int i = 1; i <= 8; ++i) {
-      above[min_base_z2 - i] = above[min_base_z2];
-      left[min_base_z2 - i] = left[min_base_z2];
-    }
-    if (mrl_index == 0) {
-      above[max_base_z2_above + 1] = above[max_base_z2_above];
-      left[max_base_z2_left + 1] = left[max_base_z2_left];
-    }
+    highbd_pad_intra_edge_8(&above[min_base_z2 - 8], above[min_base_z2]);
+    highbd_pad_intra_edge_8(&left[min_base_z2 - 8], left[min_base_z2]);
+    const int above_edge_len = bw + (mrl_index << 1);
+    const int left_edge_len = bh + (mrl_index ? 3 + (mrl_index << 1) : 0);
+    highbd_pad_intra_edge_8(&above[above_edge_len], above[above_edge_len - 1]);
+    highbd_pad_intra_edge_8(&left[left_edge_len], left[left_edge_len - 1]);
     av2_highbd_dr_prediction_z2_idif(dst, stride, bw, bh, above, left, dx, dy,
                                      bd, mrl_index);
 
   } else if (angle > 180 && angle < 270) {
-    for (int i = 1; i <= 10; ++i)
-      left[max_base_z1_z3 + i] = left[max_base_z1_z3];
+    highbd_pad_intra_edge_17(&left[max_base_z1_z3 + 1], left[max_base_z1_z3]);
     av2_highbd_dr_prediction_z3_idif(dst, stride, bw, bh, above, left, dx, dy,
                                      bd, mrl_index);
 
@@ -854,8 +884,8 @@ static void highbd_dr_predictor_idif(uint16_t *dst, ptrdiff_t stride,
 }
 
 static void highbd_dr_predictor(uint16_t *dst, ptrdiff_t stride,
-                                TX_SIZE tx_size, const uint16_t *above,
-                                const uint16_t *left, int angle, int bd,
+                                TX_SIZE tx_size, uint16_t *above,
+                                uint16_t *left, int angle, int bd,
                                 int mrl_index) {
   const int dx = av2_get_dx(angle);
   const int dy = av2_get_dy(angle);
@@ -863,13 +893,24 @@ static void highbd_dr_predictor(uint16_t *dst, ptrdiff_t stride,
   const int bh = tx_size_high[tx_size];
   assert(angle > 0 && angle < 270);
 
+  const int max_base_z1_z3 = (bw + bh) - 1 + (mrl_index << 1);
+  const int min_base_z2 = -(1 + mrl_index);
+
   if (angle > 0 && angle < 90) {
+    highbd_pad_intra_edge_17(&above[max_base_z1_z3 + 1], above[max_base_z1_z3]);
     av2_highbd_dr_prediction_z1(dst, stride, bw, bh, above, left, dx, dy, bd,
                                 mrl_index);
   } else if (angle > 90 && angle < 180) {
+    highbd_pad_intra_edge_8(&above[min_base_z2 - 8], above[min_base_z2]);
+    highbd_pad_intra_edge_8(&left[min_base_z2 - 8], left[min_base_z2]);
+    const int above_edge_len = bw + (mrl_index << 1);
+    const int left_edge_len = bh + (mrl_index ? 3 + (mrl_index << 1) : 0);
+    highbd_pad_intra_edge_8(&above[above_edge_len], above[above_edge_len - 1]);
+    highbd_pad_intra_edge_8(&left[left_edge_len], left[left_edge_len - 1]);
     av2_highbd_dr_prediction_z2(dst, stride, bw, bh, above, left, dx, dy, bd,
                                 mrl_index);
   } else if (angle > 180 && angle < 270) {
+    highbd_pad_intra_edge_17(&left[max_base_z1_z3 + 1], left[max_base_z1_z3]);
     av2_highbd_dr_prediction_z3(dst, stride, bw, bh, above, left, dx, dy, bd,
                                 mrl_index);
   } else if (angle == 90) {
@@ -881,20 +922,22 @@ static void highbd_dr_predictor(uint16_t *dst, ptrdiff_t stride,
 
 // Generate the second directional predictor for IBP
 static void highbd_second_dr_predictor(uint16_t *dst, ptrdiff_t stride,
-                                       TX_SIZE tx_size, const uint16_t *above,
-                                       const uint16_t *left, int angle,
-                                       int bd) {
+                                       TX_SIZE tx_size, uint16_t *above,
+                                       uint16_t *left, int angle, int bd) {
   const int bw = tx_size_wide[tx_size];
   const int bh = tx_size_high[tx_size];
+  const int max_base = (bw + bh) - 1;
 
   if (angle > 0 && angle < 90) {
     int dy = dr_intra_derivative[90 - angle];
     int dx = 1;
+    highbd_pad_intra_edge_17(&left[max_base + 1], left[max_base]);
     av2_highbd_dr_prediction_z3(dst, stride, bw, bh, above, left, dx, dy, bd,
                                 0);
   } else if (angle > 180 && angle < 270) {
     int dx = dr_intra_derivative[angle - 180];
     int dy = 1;
+    highbd_pad_intra_edge_17(&above[max_base + 1], above[max_base]);
     av2_highbd_dr_prediction_z1(dst, stride, bw, bh, above, left, dx, dy, bd,
                                 0);
   }
@@ -912,13 +955,13 @@ static void highbd_second_dr_predictor_idif(uint16_t *dst, ptrdiff_t stride,
   if (angle > 0 && angle < 90) {
     int dy = dr_intra_derivative[90 - angle];
     int dx = 1;
-    for (int i = 1; i <= 10; ++i) left[max_base + i] = left[max_base];
+    highbd_pad_intra_edge_17(&left[max_base + 1], left[max_base]);
     av2_highbd_dr_prediction_z3_idif(dst, stride, bw, bh, above, left, dx, dy,
                                      bd, 0);
   } else if (angle > 180 && angle < 270) {
     int dx = dr_intra_derivative[angle - 180];
     int dy = 1;
-    for (int i = 1; i <= 10; ++i) above[max_base + i] = above[max_base];
+    highbd_pad_intra_edge_17(&above[max_base + 1], above[max_base]);
     av2_highbd_dr_prediction_z1_idif(dst, stride, bw, bh, above, left, dx, dy,
                                      bd, 0);
   }
@@ -1119,16 +1162,6 @@ void av2_build_intra_predictors_high(
   const int is_multi_line_mrls_allowed_blk_sz = (tx_size == TX_4X4) ? 0 : 1;
   const int need_2nd_line =
       mbmi->multi_line_mrl && mrl_index && is_multi_line_mrls_allowed_blk_sz;
-  // The left_data, above_data buffers must be zeroed to fix some intermittent
-  // valgrind errors. Uninitialized reads in intra pred modules (e.g. width =
-  // 4 path in av2_highbd_dr_prediction_z2_avx2()) from left_data, above_data
-  // are seen to be the potential reason for this issue.
-  avm_memset16(left_data_1st, base + 1, NUM_INTRA_NEIGHBOUR_PIXELS);
-  avm_memset16(above_data_1st, base - 1, NUM_INTRA_NEIGHBOUR_PIXELS);
-  if (need_2nd_line) {
-    avm_memset16(left_data_2nd, base + 1, NUM_INTRA_NEIGHBOUR_PIXELS);
-    avm_memset16(above_data_2nd, base - 1, NUM_INTRA_NEIGHBOUR_PIXELS);
-  }
 
   // The default values if ref pixels are not available:
   // base   base-1 base-1 .. base-1 base-1 base-1 base-1 base-1 base-1
@@ -1160,45 +1193,73 @@ void av2_build_intra_predictors_high(
   assert(n_left_px >= 0);
   assert(n_bottomleft_px >= 0);
 
-  if (xd->mi[0]->multi_line_mrl == 0 &&
+  if (mbmi->multi_line_mrl == 0 &&
       ((!need_above && n_left_px == 0) || (!need_left && n_top_px == 0))) {
-    int val;
-    if (need_left) {
-      val = (n_top_px > 0) ? above_ref_1st[0] : base + 1;
-    } else {
-      val = (n_left_px > 0) ? left_ref_1st[0] : base - 1;
-    }
+    const uint16_t default_pred_val =
+        need_left ? (uint16_t)((n_top_px > 0) ? above_ref_1st[0] : base + 1)
+                  : (uint16_t)((n_left_px > 0) ? left_ref_1st[0] : base - 1);
     for (i = 0; i < txhpx; ++i) {
-      avm_memset16(dst, val, txwpx);
+      avm_memset16(dst, default_pred_val, txwpx);
       dst += dst_stride;
     }
     return;
   }
 
+  int ibp_mode_index = -1;
+  int use_dr_ibp = 0;
+  if (is_dr_mode && !use_intra_dip && apply_ibp && mrl_index == 0 &&
+      (angle_delta % 2 == 0) && plane == PLANE_TYPE_Y) {
+    if (p_angle > 0 && p_angle < 90) {
+      ibp_mode_index = angle_to_mode_index[p_angle];
+      use_dr_ibp = is_ibp_enabled[ibp_mode_index];
+    } else if (p_angle > 180 && p_angle < 270) {
+      ibp_mode_index = angle_to_mode_index[270 - p_angle];
+      use_dr_ibp = is_ibp_enabled[ibp_mode_index];
+    }
+  }
+  int load_left_edge = need_left;
+  int load_above_edge = need_above;
+  int load_above_left_edge = need_above_left;
+  if (is_dr_mode && !use_intra_dip && !use_dr_ibp) {
+    if (p_angle < 90) {
+      load_left_edge = 0;
+    } else if (p_angle == 90) {
+      load_left_edge = 0;
+      load_above_left_edge = 0;
+    } else if (p_angle == 180) {
+      load_above_edge = 0;
+      load_above_left_edge = 0;
+    } else if (p_angle > 180) {
+      load_above_edge = 0;
+    }
+  }
+
   // NEED_LEFT
-  if (need_left) {
+  if (load_left_edge) {
     int need_bottom = extend_modes[mode] & NEED_BOTTOMLEFT;
     if (use_intra_dip) need_bottom = 1;
     if (is_dr_mode)
       need_bottom =
-          apply_ibp ? (p_angle < 90) || (p_angle > 180) : p_angle > 180;
+          use_dr_ibp ? (p_angle < 90) || (p_angle > 180) : p_angle > 180;
     int num_left_pixels_needed =
         txhpx + (need_bottom ? txwpx : 3) + (mrl_index << 1);
     if (use_intra_dip) {
       // DIP mode requires left edge + 1/4 tx height for overhang feature.
       num_left_pixels_needed = txhpx + (txhpx >> 2);
     }
-    i = 0;
     if (n_left_px > 0) {
-      for (; i < n_left_px; i++) {
-        left_col_1st[i] = left_ref_1st[i * ref_stride];
-        if (need_2nd_line) left_col_2nd[i] = left_ref_2nd[i * ref_stride];
-      }
-      if (need_bottom && n_bottomleft_px > 0) {
-        assert(i == txhpx);
-        for (; i < txhpx + n_bottomleft_px; i++) {
+      const int num_avail_left_px =
+          n_left_px +
+          ((need_bottom && n_bottomleft_px > 0) ? n_bottomleft_px : 0);
+      if (need_bottom && n_bottomleft_px > 0) assert(n_left_px == txhpx);
+      if (need_2nd_line) {
+        for (i = 0; i < num_avail_left_px; i++) {
           left_col_1st[i] = left_ref_1st[i * ref_stride];
-          if (need_2nd_line) left_col_2nd[i] = left_ref_2nd[i * ref_stride];
+          left_col_2nd[i] = left_ref_2nd[i * ref_stride];
+        }
+      } else {
+        for (i = 0; i < num_avail_left_px; i++) {
+          left_col_1st[i] = left_ref_1st[i * ref_stride];
         }
       }
       if (i < num_left_pixels_needed) {
@@ -1212,15 +1273,28 @@ void av2_build_intra_predictors_high(
       avm_memset16(left_col_1st, above_ref_1st[0], num_left_pixels_needed);
       if (need_2nd_line)
         avm_memset16(left_col_2nd, above_ref_2nd[0], num_left_pixels_needed);
+    } else {
+      avm_memset16(left_col_1st, (uint16_t)(base + 1), num_left_pixels_needed);
+      if (need_2nd_line)
+        avm_memset16(left_col_2nd, (uint16_t)(base + 1),
+                     num_left_pixels_needed);
+    }
+    if (!use_intra_dip) {
+      highbd_pad_intra_edge_8(&left_col_1st[num_left_pixels_needed],
+                              left_col_1st[num_left_pixels_needed - 1]);
+      if (need_2nd_line)
+        highbd_pad_intra_edge_8(&left_col_2nd[num_left_pixels_needed],
+                                left_col_2nd[num_left_pixels_needed - 1]);
     }
   }
 
   // NEED_ABOVE
-  if (need_above) {
+  if (load_above_edge) {
     int need_right = extend_modes[mode] & NEED_ABOVERIGHT;
     if (use_intra_dip) need_right = 1;
     if (is_dr_mode)
-      need_right = apply_ibp ? (p_angle < 90) || (p_angle > 180) : p_angle < 90;
+      need_right =
+          use_dr_ibp ? (p_angle < 90) || (p_angle > 180) : p_angle < 90;
     int num_top_pixels_needed =
         txwpx + (need_right ? txhpx : 0) + (mrl_index << 1);
     if (use_intra_dip) {
@@ -1228,20 +1302,15 @@ void av2_build_intra_predictors_high(
       num_top_pixels_needed = txwpx + (txwpx >> 2);
     }
     if (n_top_px > 0) {
-      memcpy(above_row_1st, above_ref_1st, n_top_px * sizeof(above_ref_1st[0]));
+      const int num_avail_top_px =
+          n_top_px + ((need_right && n_topright_px > 0) ? n_topright_px : 0);
+      if (need_right && n_topright_px > 0) assert(n_top_px == txwpx);
+      memcpy(above_row_1st, above_ref_1st,
+             num_avail_top_px * sizeof(above_ref_1st[0]));
       if (need_2nd_line)
         memcpy(above_row_2nd, above_ref_2nd,
-               n_top_px * sizeof(above_ref_2nd[0]));
-      i = n_top_px;
-      if (need_right && n_topright_px > 0) {
-        assert(n_top_px == txwpx);
-        memcpy(above_row_1st + txwpx, above_ref_1st + txwpx,
-               n_topright_px * sizeof(above_ref_1st[0]));
-        if (need_2nd_line)
-          memcpy(above_row_2nd + txwpx, above_ref_2nd + txwpx,
-                 n_topright_px * sizeof(above_ref_2nd[0]));
-        i += n_topright_px;
-      }
+               num_avail_top_px * sizeof(above_ref_2nd[0]));
+      i = num_avail_top_px;
       if (i < num_top_pixels_needed) {
         avm_memset16(&above_row_1st[i], above_row_1st[i - 1],
                      num_top_pixels_needed - i);
@@ -1253,32 +1322,60 @@ void av2_build_intra_predictors_high(
       avm_memset16(above_row_1st, left_ref_1st[0], num_top_pixels_needed);
       if (need_2nd_line)
         avm_memset16(above_row_2nd, left_ref_2nd[0], num_top_pixels_needed);
+    } else {
+      avm_memset16(above_row_1st, (uint16_t)(base - 1), num_top_pixels_needed);
+      if (need_2nd_line)
+        avm_memset16(above_row_2nd, (uint16_t)(base - 1),
+                     num_top_pixels_needed);
+    }
+    if (!use_intra_dip) {
+      highbd_pad_intra_edge_8(&above_row_1st[num_top_pixels_needed],
+                              above_row_1st[num_top_pixels_needed - 1]);
+      if (need_2nd_line)
+        highbd_pad_intra_edge_8(&above_row_2nd[num_top_pixels_needed],
+                                above_row_2nd[num_top_pixels_needed - 1]);
     }
   }
 
-  if (need_above_left) {
-    for (i = 1; i <= mrl_index + 1; i++) {
-      if (n_top_px > 0 && n_left_px > 0) {
-        above_row_1st[-i] = above_ref_1st[-i];
-        if (need_2nd_line) above_row_2nd[-i] = above_ref_2nd[-i];
-        if (is_sb_boundary) {
-          left_col_1st[-i] = left_ref_1st[-ref_stride];
-          if (need_2nd_line) left_col_2nd[-i] = left_ref_2nd[-ref_stride];
-        } else {
-          left_col_1st[-i] = left_ref_1st[-i * ref_stride];
-          if (need_2nd_line) left_col_2nd[-i] = left_ref_2nd[-i * ref_stride];
+  if (load_above_left_edge) {
+    const int num_above_left_px = mrl_index + 1;
+    if (n_top_px > 0 && n_left_px > 0) {
+      if (is_sb_boundary) {
+        const uint16_t top_left_1st = left_ref_1st[-ref_stride];
+        const uint16_t top_left_2nd =
+            need_2nd_line ? left_ref_2nd[-ref_stride] : 0;
+        for (i = 1; i <= num_above_left_px; i++) {
+          above_row_1st[-i] = above_ref_1st[-i];
+          left_col_1st[-i] = top_left_1st;
+          if (need_2nd_line) {
+            above_row_2nd[-i] = above_ref_2nd[-i];
+            left_col_2nd[-i] = top_left_2nd;
+          }
         }
-      } else if (n_top_px > 0) {
-        above_row_1st[-i] = left_col_1st[-i] = above_ref_1st[0];
-        if (need_2nd_line)
-          above_row_2nd[-i] = left_col_2nd[-i] = above_ref_2nd[0];
-      } else if (n_left_px > 0) {
-        above_row_1st[-i] = left_col_1st[-i] = left_ref_1st[0];
-        if (need_2nd_line)
-          above_row_2nd[-i] = left_col_2nd[-i] = left_ref_2nd[0];
       } else {
-        above_row_1st[-i] = left_col_1st[-i] = base;
-        if (need_2nd_line) above_row_2nd[-i] = left_col_2nd[-i] = base;
+        for (i = 1; i <= num_above_left_px; i++) {
+          above_row_1st[-i] = above_ref_1st[-i];
+          left_col_1st[-i] = left_ref_1st[-i * ref_stride];
+          if (need_2nd_line) {
+            above_row_2nd[-i] = above_ref_2nd[-i];
+            left_col_2nd[-i] = left_ref_2nd[-i * ref_stride];
+          }
+        }
+      }
+    } else {
+      const uint16_t default_corner_1st =
+          (n_top_px > 0) ? above_ref_1st[0]
+                         : ((n_left_px > 0) ? left_ref_1st[0] : (uint16_t)base);
+      const uint16_t default_corner_2nd =
+          need_2nd_line
+              ? ((n_top_px > 0)
+                     ? above_ref_2nd[0]
+                     : ((n_left_px > 0) ? left_ref_2nd[0] : (uint16_t)base))
+              : 0;
+      for (i = 1; i <= num_above_left_px; i++) {
+        above_row_1st[-i] = left_col_1st[-i] = default_corner_1st;
+        if (need_2nd_line)
+          above_row_2nd[-i] = left_col_2nd[-i] = default_corner_2nd;
       }
     }
   }
@@ -1318,15 +1415,27 @@ void av2_build_intra_predictors_high(
       if (p_angle != 90 && p_angle != 180) {
         const int ab_le = need_above_left ? 1 : 0;
         if (need_above && need_left && (txwpx + txhpx >= 24)) {
+          if (!load_left_edge) {
+            left_col_1st[0] = (n_left_px > 0)
+                                  ? left_ref_1st[0]
+                                  : ((n_top_px > 0) ? above_ref_1st[0]
+                                                    : (uint16_t)(base + 1));
+          }
+          if (!load_above_edge) {
+            above_row_1st[0] = (n_top_px > 0)
+                                   ? above_ref_1st[0]
+                                   : ((n_left_px > 0) ? left_ref_1st[0]
+                                                      : (uint16_t)(base - 1));
+          }
           filter_intra_edge_corner_high(above_row_1st, left_col_1st);
         }
-        if (need_above && n_top_px > 0) {
+        if (load_above_edge && n_top_px > 0) {
           const int strength = intra_edge_filter_strength(
               txwpx, txhpx, angle_above, filt_type_above);
           const int n_px = n_top_px + ab_le + (need_right ? txhpx : 0);
           av2_filter_intra_edge_high(above_row_1st - ab_le, n_px, strength);
         }
-        if (need_left && n_left_px > 0) {
+        if (load_left_edge && n_left_px > 0) {
           const int strength = intra_edge_filter_strength(
               txhpx, txwpx, angle_left, filt_type_left);
           const int n_px = n_left_px + ab_le + (need_bottom ? txwpx : 0);
@@ -1341,15 +1450,7 @@ void av2_build_intra_predictors_high(
       if (need_2nd_line) {
         highbd_dr_predictor_idif(dst_mrl_line_0, txwpx, tx_size, above_row_2nd,
                                  left_col_2nd, p_angle, xd->bd, 0);
-
-        int r, c;
-        for (r = 0; r < txhpx; ++r) {
-          for (c = 0; c < txwpx; ++c) {
-            dst[r * dst_stride + c] =
-                (dst[r * dst_stride + c] + dst_mrl_line_0[r * txwpx + c] + 1) /
-                2;
-          }
-        }
+        highbd_average_mrl_pred(dst, dst_stride, dst_mrl_line_0, txwpx, txhpx);
       }
     } else {
       highbd_dr_predictor(dst, dst_stride, tx_size, above_row_1st, left_col_1st,
@@ -1357,53 +1458,26 @@ void av2_build_intra_predictors_high(
       if (need_2nd_line) {
         highbd_dr_predictor(dst_mrl_line_0, txwpx, tx_size, above_row_2nd,
                             left_col_2nd, p_angle, xd->bd, 0);
-
-        int r, c;
-        for (r = 0; r < txhpx; ++r) {
-          for (c = 0; c < txwpx; ++c) {
-            dst[r * dst_stride + c] =
-                (dst[r * dst_stride + c] + dst_mrl_line_0[r * txwpx + c] + 1) /
-                2;
-          }
-        }
+        highbd_average_mrl_pred(dst, dst_stride, dst_mrl_line_0, txwpx, txhpx);
       }
     }
-    if (apply_ibp) {
-      if (mrl_index == 0 && (angle_delta % 2 == 0) && plane == PLANE_TYPE_Y) {
-        if (p_angle > 0 && p_angle < 90) {
-          int mode_index = angle_to_mode_index[p_angle];
-          if (is_ibp_enabled[mode_index]) {
-            if (plane == AVM_PLANE_Y) {
-              highbd_second_dr_predictor_idif(second_pred, txwpx, tx_size,
-                                              above_row_1st, left_col_1st,
-                                              p_angle, xd->bd);
-            } else {
-              highbd_second_dr_predictor(second_pred, txwpx, tx_size,
-                                         above_row_1st, left_col_1st, p_angle,
-                                         xd->bd);
-            }
-            av2_highbd_ibp_dr_prediction_z1(ibp_weights, mode_index, dst,
-                                            dst_stride, second_pred, txwpx,
-                                            txwpx, txhpx);
-          }
-        }
-        if (p_angle > 180 && p_angle < 270) {
-          int mode_index = angle_to_mode_index[270 - p_angle];
-          if (is_ibp_enabled[mode_index]) {
-            if (plane == AVM_PLANE_Y) {
-              highbd_second_dr_predictor_idif(second_pred, txwpx, tx_size,
-                                              above_row_1st, left_col_1st,
-                                              p_angle, xd->bd);
-            } else {
-              highbd_second_dr_predictor(second_pred, txwpx, tx_size,
-                                         above_row_1st, left_col_1st, p_angle,
-                                         xd->bd);
-            }
-            av2_highbd_ibp_dr_prediction_z3(ibp_weights, mode_index, dst,
-                                            dst_stride, second_pred, txwpx,
-                                            txwpx, txhpx);
-          }
-        }
+    if (use_dr_ibp) {
+      if (plane == AVM_PLANE_Y) {
+        highbd_second_dr_predictor_idif(second_pred, txwpx, tx_size,
+                                        above_row_1st, left_col_1st, p_angle,
+                                        xd->bd);
+      } else {
+        highbd_second_dr_predictor(second_pred, txwpx, tx_size, above_row_1st,
+                                   left_col_1st, p_angle, xd->bd);
+      }
+      if (p_angle < 90) {
+        av2_highbd_ibp_dr_prediction_z1(ibp_weights, ibp_mode_index, dst,
+                                        dst_stride, second_pred, txwpx, txwpx,
+                                        txhpx);
+      } else {
+        av2_highbd_ibp_dr_prediction_z3(ibp_weights, ibp_mode_index, dst,
+                                        dst_stride, second_pred, txwpx, txwpx,
+                                        txhpx);
       }
     }
 
@@ -1499,36 +1573,58 @@ void av2_build_intra_predictors_high_default(
 
   if (mbmi->multi_line_mrl == 0 &&
       ((!need_above && n_left_px == 0) || (!need_left && n_top_px == 0))) {
-    int val;
-    if (need_left) {
-      val = (n_top_px > 0) ? above_ref_1st[0] : base + 1;
-    } else {
-      val = (n_left_px > 0) ? left_ref_1st[0] : base - 1;
-    }
+    const uint16_t default_pred_val =
+        need_left ? (uint16_t)((n_top_px > 0) ? above_ref_1st[0] : base + 1)
+                  : (uint16_t)((n_left_px > 0) ? left_ref_1st[0] : base - 1);
     for (i = 0; i < txhpx; ++i) {
-      avm_memset16(dst, val, txwpx);
+      avm_memset16(dst, default_pred_val, txwpx);
       dst += dst_stride;
     }
     return;
   }
 
+  int ibp_mode_index = -1;
+  int use_dr_ibp = 0;
+  if (is_dr_mode && !use_intra_dip && apply_ibp && (angle_delta % 2 == 0) &&
+      plane == PLANE_TYPE_Y) {
+    if (p_angle > 0 && p_angle < 90) {
+      ibp_mode_index = angle_to_mode_index[p_angle];
+      use_dr_ibp = is_ibp_enabled[ibp_mode_index];
+    } else if (p_angle > 180 && p_angle < 270) {
+      ibp_mode_index = angle_to_mode_index[270 - p_angle];
+      use_dr_ibp = is_ibp_enabled[ibp_mode_index];
+    }
+  }
+  int load_left_edge = need_left;
+  int load_above_edge = need_above;
+  int load_above_left_edge = need_above_left;
+  if (is_dr_mode && !use_intra_dip && !use_dr_ibp) {
+    if (p_angle < 90) {
+      load_left_edge = 0;
+    } else if (p_angle == 90) {
+      load_left_edge = 0;
+      load_above_left_edge = 0;
+    } else if (p_angle == 180) {
+      load_above_edge = 0;
+      load_above_left_edge = 0;
+    } else if (p_angle > 180) {
+      load_above_edge = 0;
+    }
+  }
+
   // NEED_LEFT
-  if (need_left) {
+  if (load_left_edge) {
     int num_left_pixels_needed = txhpx + (n_bottomleft_px >= 0 ? txwpx : 3);
     if (use_intra_dip) {
       // DIP mode requires left edge + 1/4 tx height for overhang feature.
       num_left_pixels_needed = txhpx + (txhpx >> 2);
     }
-    i = 0;
     if (n_left_px > 0) {
-      for (; i < n_left_px; i++) {
+      const int num_avail_left_px =
+          n_left_px + (n_bottomleft_px > 0 ? n_bottomleft_px : 0);
+      if (n_bottomleft_px > 0) assert(n_left_px == txhpx);
+      for (i = 0; i < num_avail_left_px; i++) {
         left_col_1st[i] = left_ref_1st[i * ref_stride];
-      }
-      if (n_bottomleft_px > 0) {
-        assert(i == txhpx);
-        for (; i < txhpx + n_bottomleft_px; i++) {
-          left_col_1st[i] = left_ref_1st[i * ref_stride];
-        }
       }
       if (i < num_left_pixels_needed) {
         avm_memset16(&left_col_1st[i], left_col_1st[i - 1],
@@ -1537,26 +1633,28 @@ void av2_build_intra_predictors_high_default(
     } else if (n_top_px > 0) {
       avm_memset16(left_col_1st, above_ref_1st[0], num_left_pixels_needed);
     } else {
-      avm_memset16(left_col_1st, base + 1, num_left_pixels_needed);
+      avm_memset16(left_col_1st, (uint16_t)(base + 1), num_left_pixels_needed);
+    }
+    if (!use_intra_dip) {
+      highbd_pad_intra_edge_8(&left_col_1st[num_left_pixels_needed],
+                              left_col_1st[num_left_pixels_needed - 1]);
     }
   }
 
   // NEED_ABOVE
-  if (need_above) {
+  if (load_above_edge) {
     int num_top_pixels_needed = txwpx + (n_topright_px >= 0 ? txhpx : 0);
     if (use_intra_dip) {
       // DIP mode requires above line + 1/4 tx width for overhang feature.
       num_top_pixels_needed = txwpx + (txwpx >> 2);
     }
     if (n_top_px > 0) {
-      memcpy(above_row_1st, above_ref_1st, n_top_px * sizeof(above_ref_1st[0]));
-      i = n_top_px;
-      if (n_topright_px > 0) {
-        assert(n_top_px == txwpx);
-        memcpy(above_row_1st + txwpx, above_ref_1st + txwpx,
-               n_topright_px * sizeof(above_ref_1st[0]));
-        i += n_topright_px;
-      }
+      const int num_avail_top_px =
+          n_top_px + (n_topright_px > 0 ? n_topright_px : 0);
+      if (n_topright_px > 0) assert(n_top_px == txwpx);
+      memcpy(above_row_1st, above_ref_1st,
+             num_avail_top_px * sizeof(above_ref_1st[0]));
+      i = num_avail_top_px;
       if (i < num_top_pixels_needed) {
         avm_memset16(&above_row_1st[i], above_row_1st[i - 1],
                      num_top_pixels_needed - i);
@@ -1564,11 +1662,15 @@ void av2_build_intra_predictors_high_default(
     } else if (n_left_px > 0) {
       avm_memset16(above_row_1st, left_ref_1st[0], num_top_pixels_needed);
     } else {
-      avm_memset16(above_row_1st, base - 1, num_top_pixels_needed);
+      avm_memset16(above_row_1st, (uint16_t)(base - 1), num_top_pixels_needed);
+    }
+    if (!use_intra_dip) {
+      highbd_pad_intra_edge_8(&above_row_1st[num_top_pixels_needed],
+                              above_row_1st[num_top_pixels_needed - 1]);
     }
   }
 
-  if (need_above_left) {
+  if (load_above_left_edge) {
     if (n_top_px > 0 && n_left_px > 0) {
       above_row_1st[-1] = above_ref_1st[-1];
       left_col_1st[-1] = left_ref_1st[-ref_stride];
@@ -1616,15 +1718,27 @@ void av2_build_intra_predictors_high_default(
       if (p_angle != 90 && p_angle != 180) {
         const int ab_le = need_above_left ? 1 : 0;
         if (need_above && need_left && (txwpx + txhpx >= 24)) {
+          if (!load_left_edge) {
+            left_col_1st[0] = (n_left_px > 0)
+                                  ? left_ref_1st[0]
+                                  : ((n_top_px > 0) ? above_ref_1st[0]
+                                                    : (uint16_t)(base + 1));
+          }
+          if (!load_above_edge) {
+            above_row_1st[0] = (n_top_px > 0)
+                                   ? above_ref_1st[0]
+                                   : ((n_left_px > 0) ? left_ref_1st[0]
+                                                      : (uint16_t)(base - 1));
+          }
           filter_intra_edge_corner_high(above_row_1st, left_col_1st);
         }
-        if (need_above && n_top_px > 0) {
+        if (load_above_edge && n_top_px > 0) {
           const int strength = intra_edge_filter_strength(
               txwpx, txhpx, angle_above, filt_type_above);
           const int n_px = n_top_px + ab_le + (need_right ? txhpx : 0);
           av2_filter_intra_edge_high(above_row_1st - ab_le, n_px, strength);
         }
-        if (need_left && n_left_px > 0) {
+        if (load_left_edge && n_left_px > 0) {
           const int strength = intra_edge_filter_strength(
               txhpx, txwpx, angle_left, filt_type_left);
           const int n_px = n_left_px + ab_le + (need_bottom ? txwpx : 0);
@@ -1640,40 +1754,23 @@ void av2_build_intra_predictors_high_default(
       highbd_dr_predictor(dst, dst_stride, tx_size, above_row_1st, left_col_1st,
                           p_angle, xd->bd, 0 /* mrl_index */);
     }
-    if (apply_ibp && (angle_delta % 2 == 0) && plane == PLANE_TYPE_Y) {
-      if (p_angle > 0 && p_angle < 90) {
-        int mode_index = angle_to_mode_index[p_angle];
-        if (is_ibp_enabled[mode_index]) {
-          if (plane == AVM_PLANE_Y) {
-            highbd_second_dr_predictor_idif(second_pred, txwpx, tx_size,
-                                            above_row_1st, left_col_1st,
-                                            p_angle, xd->bd);
-          } else {
-            highbd_second_dr_predictor(second_pred, txwpx, tx_size,
-                                       above_row_1st, left_col_1st, p_angle,
-                                       xd->bd);
-          }
-          av2_highbd_ibp_dr_prediction_z1(ibp_weights, mode_index, dst,
-                                          dst_stride, second_pred, txwpx, txwpx,
-                                          txhpx);
-        }
+    if (use_dr_ibp) {
+      if (plane == AVM_PLANE_Y) {
+        highbd_second_dr_predictor_idif(second_pred, txwpx, tx_size,
+                                        above_row_1st, left_col_1st, p_angle,
+                                        xd->bd);
+      } else {
+        highbd_second_dr_predictor(second_pred, txwpx, tx_size, above_row_1st,
+                                   left_col_1st, p_angle, xd->bd);
       }
-      if (p_angle > 180 && p_angle < 270) {
-        int mode_index = angle_to_mode_index[270 - p_angle];
-        if (is_ibp_enabled[mode_index]) {
-          if (plane == AVM_PLANE_Y) {
-            highbd_second_dr_predictor_idif(second_pred, txwpx, tx_size,
-                                            above_row_1st, left_col_1st,
-                                            p_angle, xd->bd);
-          } else {
-            highbd_second_dr_predictor(second_pred, txwpx, tx_size,
-                                       above_row_1st, left_col_1st, p_angle,
-                                       xd->bd);
-          }
-          av2_highbd_ibp_dr_prediction_z3(ibp_weights, mode_index, dst,
-                                          dst_stride, second_pred, txwpx, txwpx,
-                                          txhpx);
-        }
+      if (p_angle < 90) {
+        av2_highbd_ibp_dr_prediction_z1(ibp_weights, ibp_mode_index, dst,
+                                        dst_stride, second_pred, txwpx, txwpx,
+                                        txhpx);
+      } else {
+        av2_highbd_ibp_dr_prediction_z3(ibp_weights, ibp_mode_index, dst,
+                                        dst_stride, second_pred, txwpx, txwpx,
+                                        txhpx);
       }
     }
 
@@ -1791,10 +1888,22 @@ void av2_predict_intra_block(const AV2_COMMON *cm, const MACROBLOCKD *xd,
       p_angle =
           wide_angle_mapping(xd->mi[0], angle_delta, tx_size, mode, plane);
     }
+    int need_ibp_ext_edges = apply_ibp;
+    if (!use_intra_dip && apply_ibp) {
+      need_ibp_ext_edges = 0;
+      if (mrl_index == 0 && (angle_delta % 2 == 0) && plane == PLANE_TYPE_Y) {
+        if (p_angle > 0 && p_angle < 90) {
+          need_ibp_ext_edges = is_ibp_enabled[angle_to_mode_index[p_angle]];
+        } else if (p_angle > 180 && p_angle < 270) {
+          need_ibp_ext_edges =
+              is_ibp_enabled[angle_to_mode_index[270 - p_angle]];
+        }
+      }
+    }
     need_top_right =
-        apply_ibp ? (p_angle < 90) || (p_angle > 180) : p_angle < 90;
+        need_ibp_ext_edges ? (p_angle < 90) || (p_angle > 180) : p_angle < 90;
     need_bottom_left =
-        apply_ibp ? (p_angle < 90) || (p_angle > 180) : p_angle > 180;
+        need_ibp_ext_edges ? (p_angle < 90) || (p_angle > 180) : p_angle > 180;
   }
 
   // Possible states for have_top_right(TR) and have_bottom_left(BL)
