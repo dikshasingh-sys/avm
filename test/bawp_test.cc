@@ -17,6 +17,7 @@
 
 namespace {
 typedef void (*make_bawp_func)(uint16_t *dst, int dst_stride, int16_t alpha,
+
                                int32_t beta, int shift, int bw, int bh, int bd);
 #if HAVE_AVX2
 const BLOCK_SIZE kValidBlockSize[] = {
@@ -28,7 +29,7 @@ const BLOCK_SIZE kValidBlockSize[] = {
   BLOCK_4X32,    BLOCK_32X4,    BLOCK_8X64,    BLOCK_64X8,
 };
 #endif  // HAVE_AVX2
-
+// temp
 typedef std::tuple<make_bawp_func, BLOCK_SIZE> BAWPParam;
 
 class BAWPTest : public ::testing::TestWithParam<BAWPParam> {

@@ -19,6 +19,7 @@
 #include "av2/common/idct.h"
 #include "av2/common/txb_common.h"
 
+// My first comment.
 void av2_highbd_inv_txfm_add_avx2(const tran_low_t *input, uint16_t *dest,
                                   int stride, const TxfmParam *txfm_param) {
   assert(av2_ext_tx_used[txfm_param->tx_set_type][txfm_param->primary_tx_type]);
