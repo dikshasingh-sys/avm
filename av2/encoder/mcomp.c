@@ -376,6 +376,14 @@ int av2_init_search_range(int size, int enable_high_motion) {
 #define SSE_LAMBDA_HDRES 1  // Used by mv_cost_err_fn
 #define SAD_LAMBDA_HDRES 8  // Used by mvsad_err_cost during full pixel search
 
+static INLINE int count_quniform_code_bits(int alphabet_size,
+                                           int symbol_value) {
+  if (alphabet_size <= 1) return 0;
+  const int msb_plus_one = get_msb(alphabet_size) + 1;
+  const int split_threshold = (1 << msb_plus_one) - alphabet_size;
+  return symbol_value < split_threshold ? msb_plus_one - 1 : msb_plus_one;
+}
+
 static INLINE int get_vq_col_mvd_cost(const MvCosts *mv_costs,
                                       const MvSubpelPrecision pb_mv_precision,
                                       const int max_coded_value, int col,
@@ -401,8 +409,7 @@ static INLINE int get_vq_col_mvd_cost(const MvCosts *mv_costs,
   if (max_coded_value > max_trunc_unary_value && col >= max_trunc_unary_value) {
     int remainder = col - max_trunc_unary_value;
     int remainder_max_value = max_coded_value - max_trunc_unary_value;
-    int length =
-        avm_count_primitive_quniform(remainder_max_value + 1, remainder);
+    int length = count_quniform_code_bits(remainder_max_value + 1, remainder);
     cost += av2_cost_literal(length);
   }
   return cost;
@@ -435,6 +442,57 @@ static INLINE int get_vq_mvd_cost(const MV mv_diff,
                                   const IntraBCMvCosts *dv_costs) {
   if (is_adaptive_mvd) {
     return get_vq_amvd_cost(mv_diff, mv_costs);
+  }
+  if (!is_ibc_cost) {
+    const int *joint_shell_cost =
+        mv_costs->nmv_joint_shell_cost[pb_mv_precision];
+    if ((mv_diff.row | mv_diff.col) == 0) {
+      return joint_shell_cost[0];
+    }
+    const int start_lsb = MV_PRECISION_ONE_EIGHTH_PEL - pb_mv_precision;
+    const int scaled_row = abs(mv_diff.row) >> start_lsb;
+    const int scaled_col = abs(mv_diff.col) >> start_lsb;
+    const int shell_index = scaled_row + scaled_col;
+    int total_cost = joint_shell_cost[shell_index];
+    if (shell_index > 0) {
+      const int maximum_pair_index = shell_index >> 1;
+      const int this_pair_index = scaled_col <= maximum_pair_index
+                                      ? scaled_col
+                                      : shell_index - scaled_col;
+      if (maximum_pair_index > 0) {
+        const int max_idx_bits =
+            AVMMIN(maximum_pair_index, MAX_COL_TRUNCATED_UNARY_VAL);
+        const int coded_col = this_pair_index > MAX_COL_TRUNCATED_UNARY_VAL
+                                  ? MAX_COL_TRUNCATED_UNARY_VAL
+                                  : this_pair_index;
+        total_cost +=
+            mv_costs->col_mv_greater_flags_costs[pb_mv_precision][max_idx_bits]
+                                                [coded_col];
+        if (maximum_pair_index > MAX_COL_TRUNCATED_UNARY_VAL &&
+            this_pair_index >= MAX_COL_TRUNCATED_UNARY_VAL) {
+          const int remainder = this_pair_index - MAX_COL_TRUNCATED_UNARY_VAL;
+          const int remainder_max =
+              maximum_pair_index - MAX_COL_TRUNCATED_UNARY_VAL;
+          total_cost += av2_cost_literal(
+              count_quniform_code_bits(remainder_max + 1, remainder));
+        }
+      }
+      if (!((this_pair_index == maximum_pair_index) &&
+            ((shell_index & 1) == 0))) {
+        const int context_index =
+            AVMMIN(get_msb(shell_index), NUM_CTX_COL_MV_INDEX - 1);
+        total_cost +=
+            mv_costs->col_mv_index_cost[pb_mv_precision][context_index]
+                                       [scaled_col > maximum_pair_index];
+      }
+    }
+    if (mv_diff.row != 0) {
+      total_cost += mv_costs->nmv_sign_cost[0][mv_diff.row < 0];
+    }
+    if (mv_diff.col != 0) {
+      total_cost += mv_costs->nmv_sign_cost[1][mv_diff.col < 0];
+    }
+    return total_cost;
   }
   // DV cost tables are only built for the IntraBC precision set.
   assert(IMPLIES(is_ibc_cost, av2_intraBc_precision_to_index[pb_mv_precision] <
@@ -620,10 +678,11 @@ static INLINE int mv_err_cost(const MV mv,
 
   switch (mv_cost_type) {
     case MV_COST_ENTROPY:
-      return get_mv_cost_with_precision(
-          mv, ref_mv, mv_cost_params->pb_mv_precision,
-          mv_cost_params->is_adaptive_mvd, mv_cost_params->is_ibc_cost,
-          mv_costs, mv_costs->errorperbit,
+      return (int)ROUND_POWER_OF_TWO_64(
+          (int64_t)get_vq_mvd_cost(diff, pb_mv_precision, mv_costs,
+                                   mv_cost_params->is_adaptive_mvd,
+                                   mv_cost_params->is_ibc_cost, NULL) *
+              mv_costs->errorperbit,
           RDDIV_BITS + AV2_PROB_COST_SHIFT - RD_EPB_SHIFT +
               PIXEL_TRANSFORM_ERROR_SCALE);
 
@@ -633,6 +692,67 @@ static INLINE int mv_err_cost(const MV mv,
       return (SSE_LAMBDA_MIDRES * (abs_diff.row + abs_diff.col)) >> 3;
     case MV_COST_L1_HDRES:
       return (SSE_LAMBDA_HDRES * (abs_diff.row + abs_diff.col)) >> 3;
+    case MV_COST_NONE: return 0;
+    default: assert(0 && "Invalid rd_cost_type"); return 0;
+  }
+}
+
+#if defined(_MSC_VER)
+#define MCOMP_NOINLINE __declspec(noinline)
+#else
+#define MCOMP_NOINLINE __attribute__((noinline))
+#endif
+
+typedef struct {
+  MV lowered_ref_mv;
+  const MV_COST_PARAMS *mv_cost_params;
+} FullpelMvSadCostContext;
+
+static INLINE void init_fullpel_mv_sad_cost_context(
+    FullpelMvSadCostContext *cost_ctx, const MV_COST_PARAMS *mv_cost_params) {
+  MV ref_mv = { GET_MV_SUBPEL(mv_cost_params->full_ref_mv.row),
+                GET_MV_SUBPEL(mv_cost_params->full_ref_mv.col) };
+  if (!mv_cost_params->is_adaptive_mvd) {
+    lower_mv_precision(&ref_mv, mv_cost_params->pb_mv_precision);
+  }
+  cost_ctx->lowered_ref_mv = ref_mv;
+  cost_ctx->mv_cost_params = mv_cost_params;
+}
+
+static MCOMP_NOINLINE int compute_entropy_mv_sad_cost(
+    const MV mv_diff, const MV_COST_PARAMS *mv_cost_params) {
+  const MvCosts *mv_costs = mv_cost_params->mv_costs;
+  return ROUND_POWER_OF_TWO(
+      (unsigned)get_vq_mvd_cost(mv_diff, mv_cost_params->pb_mv_precision,
+                                mv_costs, mv_cost_params->is_adaptive_mvd,
+                                mv_cost_params->is_ibc_cost, NULL) *
+          mv_costs->sadperbit,
+      AV2_PROB_COST_SHIFT);
+}
+
+static INLINE int compute_fullpel_mv_sad_cost(
+    const FULLPEL_MV mv, const FullpelMvSadCostContext *cost_ctx) {
+  const MV_COST_PARAMS *mv_cost_params = cost_ctx->mv_cost_params;
+  const MV mv_diff = { GET_MV_SUBPEL(mv.row) - cost_ctx->lowered_ref_mv.row,
+                       GET_MV_SUBPEL(mv.col) - cost_ctx->lowered_ref_mv.col };
+  switch (mv_cost_params->mv_cost_type) {
+    case MV_COST_ENTROPY:
+      if (!mv_cost_params->is_adaptive_mvd && !mv_cost_params->is_ibc_cost &&
+          ((mv_diff.row | mv_diff.col) == 0)) {
+        const MvCosts *mv_costs = mv_cost_params->mv_costs;
+        return ROUND_POWER_OF_TWO(
+            (unsigned)mv_costs
+                    ->nmv_joint_shell_cost[mv_cost_params->pb_mv_precision][0] *
+                mv_costs->sadperbit,
+            AV2_PROB_COST_SHIFT);
+      }
+      return compute_entropy_mv_sad_cost(mv_diff, mv_cost_params);
+    case MV_COST_L1_LOWRES:
+      return (SAD_LAMBDA_LOWRES * (abs(mv_diff.row) + abs(mv_diff.col))) >> 3;
+    case MV_COST_L1_MIDRES:
+      return (SAD_LAMBDA_MIDRES * (abs(mv_diff.row) + abs(mv_diff.col))) >> 3;
+    case MV_COST_L1_HDRES:
+      return (SAD_LAMBDA_HDRES * (abs(mv_diff.row) + abs(mv_diff.col))) >> 3;
     case MV_COST_NONE: return 0;
     default: assert(0 && "Invalid rd_cost_type"); return 0;
   }
@@ -1173,7 +1293,7 @@ static AVM_FORCE_INLINE void calc_int_cost_list(
 // than var but faster.
 static AVM_FORCE_INLINE void calc_int_sad_list(
     const FULLPEL_MV best_mv, const FULLPEL_MOTION_SEARCH_PARAMS *ms_params,
-    int *cost_list, int costlist_has_sad) {
+    int *cost_list, int costlist_has_sad, unsigned int known_best_raw_sad) {
   static const FULLPEL_MV neighbors[4] = {
     { 0, -1 }, { 1, 0 }, { 0, 1 }, { -1, 0 }
   };
@@ -1190,30 +1310,49 @@ static AVM_FORCE_INLINE void calc_int_sad_list(
 
   // Refresh the costlist it does not contain valid sad
   if (!costlist_has_sad) {
-    if (ms_params->is_intra_mode &&
-        ms_params->cm->features.allow_local_intrabc) {
+    const uint16_t *const best_ref_ptr = get_buf_from_fullmv(ref, &best_mv);
+    const int check_dv =
+        ms_params->is_intra_mode && ms_params->cm->features.allow_local_intrabc;
+    if (check_dv) {
       MV sub_mv = { (MV_COMP_DATA_TYPE)GET_MV_SUBPEL(best_mv.row),
                     (MV_COMP_DATA_TYPE)GET_MV_SUBPEL(best_mv.col) };
       int flag = av2_enc_is_dv_valid(
           sub_mv, ms_params->cm, ms_params->xd, ms_params->mi_row,
           ms_params->mi_col, ms_params->bsize, ms_params->mib_size_log2);
       if (flag) {
-        cost_list[0] = get_mvpred_sad(
-            ms_params, src, get_buf_from_fullmv(ref, &best_mv), ref_stride);
+        cost_list[0] =
+            (known_best_raw_sad < INT_MAX)
+                ? (int)known_best_raw_sad
+                : get_mvpred_sad(ms_params, src, best_ref_ptr, ref_stride);
       } else {
         cost_list[0] = INT_MAX;
       }
     } else {
-      cost_list[0] = get_mvpred_sad(
-          ms_params, src, get_buf_from_fullmv(ref, &best_mv), ref_stride);
+      cost_list[0] =
+          (known_best_raw_sad < INT_MAX)
+              ? (int)known_best_raw_sad
+              : get_mvpred_sad(ms_params, src, best_ref_ptr, ref_stride);
     }
 
     if (check_bounds(&ms_params->mv_limits, br, bc, 1)) {
-      for (int i = 0; i < 4; i++) {
-        const FULLPEL_MV this_mv = { br + neighbors[i].row,
-                                     bc + neighbors[i].col };
-        if (ms_params->is_intra_mode &&
-            ms_params->cm->features.allow_local_intrabc) {
+      if (!check_dv) {
+        const uint16_t *const neighbor_ref_ptrs[4] = {
+          best_ref_ptr - 1,
+          best_ref_ptr + ref_stride,
+          best_ref_ptr + 1,
+          best_ref_ptr - ref_stride,
+        };
+        unsigned int neighbor_sads[4];
+        ms_params->sdx4df(src->buf, src->stride, neighbor_ref_ptrs, ref_stride,
+                          neighbor_sads);
+        cost_list[1] = (int)neighbor_sads[0];
+        cost_list[2] = (int)neighbor_sads[1];
+        cost_list[3] = (int)neighbor_sads[2];
+        cost_list[4] = (int)neighbor_sads[3];
+      } else {
+        for (int i = 0; i < 4; i++) {
+          const FULLPEL_MV this_mv = { br + neighbors[i].row,
+                                       bc + neighbors[i].col };
           MV sub_mv = { (MV_COMP_DATA_TYPE)GET_MV_SUBPEL(this_mv.row),
                         (MV_COMP_DATA_TYPE)GET_MV_SUBPEL(this_mv.col) };
           int flag = av2_enc_is_dv_valid(
@@ -1225,9 +1364,6 @@ static AVM_FORCE_INLINE void calc_int_sad_list(
           } else {
             cost_list[i + 1] = INT_MAX;
           }
-        } else {
-          cost_list[i + 1] = get_mvpred_sad(
-              ms_params, src, get_buf_from_fullmv(ref, &this_mv), ref_stride);
         }
       }
     } else {
@@ -1262,14 +1398,15 @@ static AVM_FORCE_INLINE void calc_int_sad_list(
     }
   }
 
-  const MV_COST_PARAMS *mv_cost_params = &ms_params->mv_cost_params;
-  cost_list[0] += mvsad_err_cost(best_mv, mv_cost_params);
+  FullpelMvSadCostContext sad_cost_ctx;
+  init_fullpel_mv_sad_cost_context(&sad_cost_ctx, &ms_params->mv_cost_params);
+  cost_list[0] += compute_fullpel_mv_sad_cost(best_mv, &sad_cost_ctx);
 
   for (int idx = 0; idx < 4; idx++) {
     if (cost_list[idx + 1] != INT_MAX) {
       const FULLPEL_MV this_mv = { br + neighbors[idx].row,
                                    bc + neighbors[idx].col };
-      cost_list[idx + 1] += mvsad_err_cost(this_mv, mv_cost_params);
+      cost_list[idx + 1] += compute_fullpel_mv_sad_cost(this_mv, &sad_cost_ctx);
     }
   }
 }
@@ -1662,7 +1799,8 @@ static int pattern_search(FULLPEL_MV start_mv,
   // cost_list[4]: cost/sad at delta {-1, 0} (top)    from the best integer pel
   if (cost_list) {
     if (USE_SAD_COSTLIST) {
-      calc_int_sad_list(*best_mv, ms_params, cost_list, costlist_has_sad);
+      calc_int_sad_list(*best_mv, ms_params, cost_list, costlist_has_sad,
+                        raw_bestsad);
     } else {
       calc_int_cost_list(*best_mv, ms_params, cost_list);
     }
@@ -1738,8 +1876,12 @@ static int fast_bigdia_search(const FULLPEL_MV start_mv,
 
 static int diamond_search_sad(FULLPEL_MV start_mv,
                               const FULLPEL_MOTION_SEARCH_PARAMS *ms_params,
+                              const FullpelMvSadCostContext *sad_cost_ctx,
                               const int search_step, int *num00,
-                              FULLPEL_MV *best_mv, FULLPEL_MV *second_best_mv) {
+                              FULLPEL_MV *best_mv, FULLPEL_MV *second_best_mv,
+                              unsigned int *best_raw_sad_out,
+                              unsigned int cardinal_neighbor_sads_out[4],
+                              int *has_cardinal_neighbor_sads_out) {
   const struct buf_2d *const src = ms_params->ms_buffers.src;
   const struct buf_2d *const ref = ms_params->ms_buffers.ref;
 
@@ -1748,7 +1890,6 @@ static int diamond_search_sad(FULLPEL_MV start_mv,
 
   const uint8_t *mask = ms_params->ms_buffers.mask;
   const uint16_t *second_pred = ms_params->ms_buffers.second_pred;
-  const MV_COST_PARAMS *mv_cost_params = &ms_params->mv_cost_params;
 
   const search_site_config *cfg = ms_params->search_sites;
   const int prec_shift =
@@ -1762,6 +1903,7 @@ static int diamond_search_sad(FULLPEL_MV start_mv,
       ms_params->mv_cost_params.pb_mv_precision));
 
   unsigned int bestsad = INT_MAX;
+  unsigned int best_raw_sad = INT_MAX;
   int best_site = 0;
   int is_off_center = 0;
 
@@ -1773,32 +1915,31 @@ static int diamond_search_sad(FULLPEL_MV start_mv,
 
   *num00 = 0;
   *best_mv = start_mv;
+  *has_cardinal_neighbor_sads_out = 0;
 
   // Check the starting position
-
-  if (ms_params->is_intra_mode && ms_params->cm->features.allow_local_intrabc) {
+  const int check_dv =
+      ms_params->is_intra_mode && ms_params->cm->features.allow_local_intrabc;
+  best_address = get_buf_from_fullmv(ref, &start_mv);
+  if (check_dv) {
     MV sub_mv = { (MV_COMP_DATA_TYPE)GET_MV_SUBPEL(start_mv.row),
                   (MV_COMP_DATA_TYPE)GET_MV_SUBPEL(start_mv.col) };
     if (av2_enc_is_dv_valid(sub_mv, ms_params->cm, ms_params->xd,
                             ms_params->mi_row, ms_params->mi_col,
                             ms_params->bsize, ms_params->mib_size_log2)) {
-      best_address = get_buf_from_fullmv(ref, &start_mv);
-      bestsad =
+      best_raw_sad =
           get_mvpred_compound_sad(ms_params, src, best_address, ref_stride);
-      bestsad += mvsad_err_cost(*best_mv, &ms_params->mv_cost_params);
-    } else {
-      best_address = get_buf_from_fullmv(ref, &start_mv);
-      bestsad = INT_MAX;
+      bestsad =
+          best_raw_sad + compute_fullpel_mv_sad_cost(*best_mv, sad_cost_ctx);
     }
   } else {
-    best_address = get_buf_from_fullmv(ref, &start_mv);
-    bestsad = get_mvpred_compound_sad(ms_params, src, best_address, ref_stride);
-    bestsad += mvsad_err_cost(*best_mv, &ms_params->mv_cost_params);
+    best_raw_sad =
+        get_mvpred_compound_sad(ms_params, src, best_address, ref_stride);
+    bestsad =
+        best_raw_sad + compute_fullpel_mv_sad_cost(*best_mv, sad_cost_ctx);
   }
 
-  // IntraBC block vectors must also pass av2_is_dv_valid().
-  const int check_dv =
-      ms_params->is_intra_mode && ms_params->cm->features.allow_local_intrabc;
+  const int use_site_offsets = (prec_shift == 0 && cfg->stride == ref_stride);
   int next_step_size = tot_steps > 2 ? cfg->radius[tot_steps - 2] : 1;
   for (int step = tot_steps - 1; step >= 0; --step) {
     const search_site *site = cfg->site[step];
@@ -1852,13 +1993,26 @@ static int diamond_search_sad(FULLPEL_MV start_mv,
         }
         if (!valid) continue;
 
-        for (j = 0; j < 4; j++) {
-          int row = (site[idx + j].mv.row * prec_multiplier);
-          int col = (site[idx + j].mv.col * prec_multiplier);
-          block_offset[j] = (row * ref_stride + col) + best_address;
+        if (use_site_offsets) {
+          block_offset[0] = best_address + site[idx].offset;
+          block_offset[1] = best_address + site[idx + 1].offset;
+          block_offset[2] = best_address + site[idx + 2].offset;
+          block_offset[3] = best_address + site[idx + 3].offset;
+        } else {
+          for (j = 0; j < 4; j++) {
+            int row = (site[idx + j].mv.row * prec_multiplier);
+            int col = (site[idx + j].mv.col * prec_multiplier);
+            block_offset[j] = (row * ref_stride + col) + best_address;
+          }
         }
 
         ms_params->sdx4df(src_buf, src_stride, block_offset, ref_stride, sads);
+        if (step == 0 && idx == 1 && !check_dv && prec_shift == 0) {
+          cardinal_neighbor_sads_out[0] = sads[0];
+          cardinal_neighbor_sads_out[1] = sads[1];
+          cardinal_neighbor_sads_out[2] = sads[2];
+          cardinal_neighbor_sads_out[3] = sads[3];
+        }
         for (j = 0; j < 4; j++) {
           if (sads[j] < bestsad) {
             const FULLPEL_MV this_mv = {
@@ -1867,13 +2021,18 @@ static int diamond_search_sad(FULLPEL_MV start_mv,
             };
 
             unsigned int thissad =
-                sads[j] + mvsad_err_cost(this_mv, mv_cost_params);
+                sads[j] + compute_fullpel_mv_sad_cost(this_mv, sad_cost_ctx);
             if (thissad < bestsad) {
               bestsad = thissad;
+              best_raw_sad = sads[j];
               best_site = idx + j;
             }
           }
         }
+      }
+      if (step == 0 && best_site == 0 && !check_dv && prec_shift == 0 &&
+          cfg->radius[0] == 1) {
+        *has_cardinal_neighbor_sads_out = 1;
       }
     } else {
       for (int idx = 1; idx <= cfg->searches_per_step[step]; idx++) {
@@ -1908,9 +2067,11 @@ static int diamond_search_sad(FULLPEL_MV start_mv,
               ms_params->mv_cost_params.pb_mv_precision));
 
           if (thissad < bestsad) {
-            thissad += mvsad_err_cost(this_mv, mv_cost_params);
-            if (thissad < bestsad) {
-              bestsad = thissad;
+            const unsigned int total_sad =
+                thissad + compute_fullpel_mv_sad_cost(this_mv, sad_cost_ctx);
+            if (total_sad < bestsad) {
+              bestsad = total_sad;
+              best_raw_sad = thissad;
               best_site = idx;
             }
           }
@@ -1941,6 +2102,7 @@ static int diamond_search_sad(FULLPEL_MV start_mv,
     }
   }
 
+  *best_raw_sad_out = best_raw_sad;
   return bestsad;
 }
 
@@ -1950,11 +2112,20 @@ static int diamond_search_sad(FULLPEL_MV start_mv,
 static int full_pixel_diamond(const FULLPEL_MV start_mv,
                               const FULLPEL_MOTION_SEARCH_PARAMS *ms_params,
                               const int step_param, int *cost_list,
-                              FULLPEL_MV *best_mv, FULLPEL_MV *second_best_mv) {
+                              FULLPEL_MV *best_mv, FULLPEL_MV *second_best_mv,
+                              unsigned int *best_raw_sad_out) {
   const search_site_config *cfg = ms_params->search_sites;
+  FullpelMvSadCostContext sad_cost_ctx;
+  init_fullpel_mv_sad_cost_context(&sad_cost_ctx, &ms_params->mv_cost_params);
+
+  unsigned int best_raw_sad = INT_MAX;
+  unsigned int cardinal_neighbor_sads[4];
+  int has_cardinal_neighbor_sads = 0;
   int thissme, n, num00 = 0;
-  int bestsme = diamond_search_sad(start_mv, ms_params, step_param, &n, best_mv,
-                                   second_best_mv);
+  int bestsme =
+      diamond_search_sad(start_mv, ms_params, &sad_cost_ctx, step_param, &n,
+                         best_mv, second_best_mv, &best_raw_sad,
+                         cardinal_neighbor_sads, &has_cardinal_neighbor_sads);
 
   if (bestsme < INT_MAX) {
     bestsme = get_mvpred_compound_var_cost(ms_params, best_mv);
@@ -1972,25 +2143,47 @@ static int full_pixel_diamond(const FULLPEL_MV start_mv,
       // TODO(chiyotsai@google.com): There is another bug here where the second
       // best mv gets incorrectly overwritten. Fix it later.
       FULLPEL_MV tmp_best_mv;
-      thissme = diamond_search_sad(start_mv, ms_params, step_param + n, &num00,
-                                   &tmp_best_mv, second_best_mv);
+      unsigned int tmp_raw_sad = INT_MAX;
+      unsigned int tmp_neighbor_sads[4];
+      int tmp_has_neighbor_sads = 0;
+      thissme =
+          diamond_search_sad(start_mv, ms_params, &sad_cost_ctx, step_param + n,
+                             &num00, &tmp_best_mv, second_best_mv, &tmp_raw_sad,
+                             tmp_neighbor_sads, &tmp_has_neighbor_sads);
 
-      if (thissme < INT_MAX) {
+      if (thissme < INT_MAX && (tmp_best_mv.row != best_mv->row ||
+                                tmp_best_mv.col != best_mv->col)) {
         thissme = get_mvpred_compound_var_cost(ms_params, &tmp_best_mv);
-      }
-
-      if (thissme < bestsme) {
-        bestsme = thissme;
-        *best_mv = tmp_best_mv;
+        if (thissme < bestsme) {
+          bestsme = thissme;
+          *best_mv = tmp_best_mv;
+          best_raw_sad = tmp_raw_sad;
+          has_cardinal_neighbor_sads = tmp_has_neighbor_sads;
+          if (tmp_has_neighbor_sads) {
+            memcpy(cardinal_neighbor_sads, tmp_neighbor_sads,
+                   sizeof(cardinal_neighbor_sads));
+          }
+        }
       }
     }
   }
 
+  *best_raw_sad_out = best_raw_sad;
+
   // Return cost list.
   if (cost_list) {
     if (USE_SAD_COSTLIST) {
-      const int costlist_has_sad = 0;
-      calc_int_sad_list(*best_mv, ms_params, cost_list, costlist_has_sad);
+      int costlist_has_sad = 0;
+      if (has_cardinal_neighbor_sads && best_raw_sad < INT_MAX) {
+        cost_list[0] = (int)best_raw_sad;
+        cost_list[1] = (int)cardinal_neighbor_sads[2];
+        cost_list[2] = (int)cardinal_neighbor_sads[1];
+        cost_list[3] = (int)cardinal_neighbor_sads[3];
+        cost_list[4] = (int)cardinal_neighbor_sads[0];
+        costlist_has_sad = 1;
+      }
+      calc_int_sad_list(*best_mv, ms_params, cost_list, costlist_has_sad,
+                        best_raw_sad);
     } else {
       calc_int_cost_list(*best_mv, ms_params, cost_list);
     }
@@ -2235,7 +2428,8 @@ static int full_pixel_exhaustive(const FULLPEL_MV start_mv,
   if (cost_list) {
     if (USE_SAD_COSTLIST) {
       const int costlist_has_sad = 0;
-      calc_int_sad_list(*best_mv, ms_params, cost_list, costlist_has_sad);
+      calc_int_sad_list(*best_mv, ms_params, cost_list, costlist_has_sad,
+                        INT_MAX);
     } else {
       calc_int_cost_list(*best_mv, ms_params, cost_list);
     }
@@ -2661,6 +2855,7 @@ int av2_full_pixel_search(const FULLPEL_MV start_mv,
       ms_params->mv_cost_params.pb_mv_precision));
 
   int var = 0;
+  unsigned int best_raw_sad = INT_MAX;
   MARK_MV_INVALID(best_mv);
   if (second_best_mv) {
     MARK_MV_INVALID(second_best_mv);
@@ -2705,7 +2900,7 @@ int av2_full_pixel_search(const FULLPEL_MV start_mv,
     case NSTEP:
     case DIAMOND:
       var = full_pixel_diamond(start_mv, ms_params, step_param, cost_list,
-                               best_mv, second_best_mv);
+                               best_mv, second_best_mv, &best_raw_sad);
       break;
     default: assert(0 && "Invalid search method.");
   }
@@ -2765,21 +2960,27 @@ int av2_full_pixel_search(const FULLPEL_MV start_mv,
     const uint16_t *best_address = get_buf_from_fullmv(ref, best_mv);
     const int sad =
         ms_params->vfp->sdf(src_address, src_stride, best_address, ref_stride);
-    const int skip_sad =
-        ms_params->vfp->sdsf(src_address, src_stride, best_address, ref_stride);
     // We will keep the result of skipping rows if it's good enough. Here, good
     // enough means the error is less than 1 per pixel.
     const int kSADThresh =
         1 << (mi_size_wide_log2[bsize] + mi_size_high_log2[bsize]);
-    if (sad > kSADThresh && abs(skip_sad - sad) * 10 >= AVMMAX(sad, 1) * 9) {
-      // There is a large discrepancy between skipping and not skipping, so we
-      // need to redo the motion search.
-      FULLPEL_MOTION_SEARCH_PARAMS new_ms_params = *ms_params;
-      new_ms_params.sdf = new_ms_params.vfp->sdf;
-      new_ms_params.sdx4df = new_ms_params.vfp->sdx4df;
+    if (sad > kSADThresh) {
+      const int skip_sad =
+          (best_raw_sad < INT_MAX && ms_params->sdf == ms_params->vfp->sdsf &&
+           !is_intra_mode)
+              ? (int)best_raw_sad
+              : (int)ms_params->vfp->sdsf(src_address, src_stride, best_address,
+                                          ref_stride);
+      if (abs(skip_sad - sad) * 10 >= AVMMAX(sad, 1) * 9) {
+        // There is a large discrepancy between skipping and not skipping, so we
+        // need to redo the motion search.
+        FULLPEL_MOTION_SEARCH_PARAMS new_ms_params = *ms_params;
+        new_ms_params.sdf = new_ms_params.vfp->sdf;
+        new_ms_params.sdx4df = new_ms_params.vfp->sdx4df;
 
-      return av2_full_pixel_search(start_mv, &new_ms_params, step_param,
-                                   cost_list, best_mv, second_best_mv);
+        return av2_full_pixel_search(start_mv, &new_ms_params, step_param,
+                                     cost_list, best_mv, second_best_mv);
+      }
     }
   }
 
