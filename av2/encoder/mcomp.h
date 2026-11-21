@@ -198,6 +198,7 @@ typedef struct {
   const search_site_config *search_sites;
   FullMvLimits mv_limits;
 
+  int prune_fullpel_diamond_restarts;
   int run_mesh_search;    // Sets mesh search unless it got pruned by
                           // prune_mesh_search.
   int prune_mesh_search;  // Disables mesh search if the best_mv after a normal

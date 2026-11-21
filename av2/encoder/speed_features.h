@@ -706,6 +706,15 @@ typedef struct MV_SPEED_FEATURES {
   //   K: search ref_mv_idx 0..K-1, reuse for ref_mv_idx >= K.
   int newmv_drl_search_limit;
 
+  // Prune redundant start_mv restart iterations in full_pixel_diamond() when
+  // the initial coarse step stayed at start_mv and best_mv converged within 4
+  // full-pels of start_mv.
+  int prune_fullpel_diamond_restarts;
+
+  // Use DIAMOND instead of NSTEP in av2_simple_motion_search for partition
+  // pruning.
+  int simple_motion_fast_fullpel;
+
   // Prune mesh search.
   int prune_mesh_search;
 

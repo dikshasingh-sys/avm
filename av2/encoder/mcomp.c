@@ -120,6 +120,7 @@ void av2_make_default_fullpel_ms_params(
   ms_params->mesh_patterns[0] = mv_sf->mesh_patterns;
   ms_params->mesh_patterns[1] = mv_sf->intrabc_mesh_patterns;
   ms_params->force_mesh_thresh = mv_sf->exhaustive_searches_thresh;
+  ms_params->prune_fullpel_diamond_restarts = 0;
   ms_params->prune_mesh_search = mv_sf->prune_mesh_search;
   ms_params->run_mesh_search = 0;
   ms_params->fine_search_interval = fine_search_interval;
@@ -1962,7 +1963,18 @@ static int full_pixel_diamond(const FULLPEL_MV start_mv,
 
   // If there won't be more n-step search, check to see if refining search is
   // needed.
-  const int further_steps = cfg->num_search_steps - 1 - step_param;
+  int further_steps = cfg->num_search_steps - 1 - step_param;
+  if (ms_params->prune_fullpel_diamond_restarts && n > 0) {
+    const int prec_shift =
+        (ms_params->mv_cost_params.pb_mv_precision < MV_PRECISION_ONE_PEL)
+            ? (MV_PRECISION_ONE_PEL - ms_params->mv_cost_params.pb_mv_precision)
+            : 0;
+    const int mv_disp = AVMMAX(abs(best_mv->row - start_mv.row),
+                               abs(best_mv->col - start_mv.col));
+    if (mv_disp <= (4 << prec_shift)) {
+      further_steps = 0;
+    }
+  }
   while (n < further_steps) {
     ++n;
 

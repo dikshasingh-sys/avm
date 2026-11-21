@@ -239,6 +239,8 @@ void av2_single_motion_search(const AV2_COMP *const cpi, MACROBLOCK *x,
   av2_make_default_fullpel_ms_params(&full_ms_params, cpi, x, bsize, &ref_mv,
                                      pb_mv_precision, is_ibc_cost,
                                      src_search_sites, fine_search_interval);
+  full_ms_params.prune_fullpel_diamond_restarts =
+      cpi->sf.mv_sf.prune_fullpel_diamond_restarts;
 
   switch (mbmi->motion_mode) {
     case SIMPLE_TRANSLATION: {
@@ -1404,6 +1406,12 @@ int_mv av2_simple_motion_search(AV2_COMP *const cpi, MACROBLOCK *x, int mi_row,
   av2_make_default_fullpel_ms_params(&full_ms_params, cpi, x, bsize, &ref_mv,
                                      pb_mv_precision, is_ibc_cost,
                                      src_search_sites, fine_search_interval);
+  full_ms_params.prune_fullpel_diamond_restarts =
+      cpi->sf.mv_sf.prune_fullpel_diamond_restarts;
+  if (cpi->sf.mv_sf.simple_motion_fast_fullpel &&
+      full_ms_params.search_method == NSTEP) {
+    av2_set_mv_search_method(&full_ms_params, src_search_sites, DIAMOND);
+  }
   full_pel_lower_mv_precision(&start_mv, pb_mv_precision);
 
   var = av2_full_pixel_search(start_mv, &full_ms_params, step_param,
@@ -1550,6 +1558,12 @@ int_mv av2_simple_motion_search_ext(AV2_COMP *const cpi,
   av2_make_default_fullpel_ms_params(&full_ms_params, cpi, x, bsize, &ref_mv,
                                      pb_mv_precision, is_ibc_cost,
                                      src_search_sites, fine_search_interval);
+  full_ms_params.prune_fullpel_diamond_restarts =
+      cpi->sf.mv_sf.prune_fullpel_diamond_restarts;
+  if (cpi->sf.mv_sf.simple_motion_fast_fullpel &&
+      full_ms_params.search_method == NSTEP) {
+    av2_set_mv_search_method(&full_ms_params, src_search_sites, DIAMOND);
+  }
 
   full_pel_lower_mv_precision(&start_mv, pb_mv_precision);
 

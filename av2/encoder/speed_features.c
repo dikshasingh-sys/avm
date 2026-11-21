@@ -865,6 +865,13 @@ static void set_good_speed_features_framesize_independent(
 
     sf->mv_sf.reduce_search_range = 1;
     sf->mv_sf.warp_search_method = WARP_SEARCH_DIAMOND;
+    if (!cm->features.is_scc_content_by_detector) {
+      sf->mv_sf.prune_fullpel_diamond_restarts = 1;
+      sf->mv_sf.simple_motion_fast_fullpel = 1;
+      if (!boosted && cm->current_frame.pyramid_level >= 3) {
+        sf->mv_sf.use_bsize_dependent_search_method = 1;
+      }
+    }
     sf->mv_sf.newmv_drl_search_limit =
         (!is_4k_or_larger && (boosted || cm->current_frame.pyramid_level <= 3))
             ? 2
@@ -1413,6 +1420,8 @@ static AVM_INLINE void init_mv_sf(MV_SPEED_FEATURES *mv_sf) {
   mv_sf->full_pixel_search_level = 0;
   mv_sf->auto_mv_step_size = 0;
   mv_sf->exhaustive_searches_thresh = 0;
+  mv_sf->prune_fullpel_diamond_restarts = 0;
+  mv_sf->simple_motion_fast_fullpel = 0;
   mv_sf->prune_mesh_search = 0;
   mv_sf->reduce_search_range = 0;
   mv_sf->skip_second_best_subpel = 0;
