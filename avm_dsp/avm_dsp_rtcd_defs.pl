@@ -377,14 +377,14 @@ if (avm_config("CONFIG_AV2_ENCODER") eq "yes") {
   specialize qw/avm_highbd_sad16x8    avx2/;
   specialize qw/avm_highbd_sad16x4    avx2/;
 
-  specialize qw/avm_highbd_sad8x16         sse2/;
-  specialize qw/avm_highbd_sad8x8          sse2/;
-  specialize qw/avm_highbd_sad8x4          sse2/;
-  specialize qw/avm_highbd_sad4x8          sse2/;
-  specialize qw/avm_highbd_sad4x4          sse2/;
+  specialize qw/avm_highbd_sad8x16    avx2 sse2/;
+  specialize qw/avm_highbd_sad8x8     avx2 sse2/;
+  specialize qw/avm_highbd_sad8x4     avx2 sse2/;
+  specialize qw/avm_highbd_sad4x8     avx2 sse2/;
+  specialize qw/avm_highbd_sad4x4     avx2 sse2/;
 
-  specialize qw/avm_highbd_sad4x16         sse2/;
-  specialize qw/avm_highbd_sad8x32         sse2/;
+  specialize qw/avm_highbd_sad4x16    avx2 sse2/;
+  specialize qw/avm_highbd_sad8x32    avx2 sse2/;
   specialize qw/avm_highbd_sad32x8    avx2 sse2/;
   specialize qw/avm_highbd_sad64x16   avx2 sse2/;
 
@@ -404,13 +404,15 @@ if (avm_config("CONFIG_AV2_ENCODER") eq "yes") {
   specialize qw/avm_highbd_sad_skip_16x16   avx2/;
   specialize qw/avm_highbd_sad_skip_16x8    avx2/;
 
-  specialize qw/avm_highbd_sad_skip_8x16         sse2/;
-  specialize qw/avm_highbd_sad_skip_8x8          sse2/;
-  specialize qw/avm_highbd_sad_skip_4x8          sse2/;
+  specialize qw/avm_highbd_sad_skip_8x16    avx2 sse2/;
+  specialize qw/avm_highbd_sad_skip_8x8     avx2 sse2/;
+  specialize qw/avm_highbd_sad_skip_8x4     avx2/;
+  specialize qw/avm_highbd_sad_skip_4x8     avx2 sse2/;
+  specialize qw/avm_highbd_sad_skip_4x4     avx2/;
 
-  specialize qw/avm_highbd_sad_skip_4x16         sse2/;
+  specialize qw/avm_highbd_sad_skip_4x16    avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_16x4         avx2/;
-  specialize qw/avm_highbd_sad_skip_8x32         sse2/;
+  specialize qw/avm_highbd_sad_skip_8x32    avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_32x8    avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_64x16   avx2 sse2/;
 
@@ -438,11 +440,11 @@ if (avm_config("CONFIG_AV2_ENCODER") eq "yes") {
   specialize qw/avm_highbd_sad32x8_avg    avx2 sse2/;
   specialize qw/avm_highbd_sad64x16_avg   avx2 sse2/;
 
-  specialize qw/avm_highbd_sad4x32       sse2/;
+  specialize qw/avm_highbd_sad4x32       avx2 sse2/;
   specialize qw/avm_highbd_sad32x4       avx2 sse2/;
-  specialize qw/avm_highbd_sad8x64       sse2/;
+  specialize qw/avm_highbd_sad8x64       avx2 sse2/;
   specialize qw/avm_highbd_sad64x8       avx2 sse2/;
-  specialize qw/avm_highbd_sad4x64       sse2/;
+  specialize qw/avm_highbd_sad4x64       avx2 sse2/;
   specialize qw/avm_highbd_sad64x4       avx2 sse2/;
 
   specialize qw/avm_highbd_sad4x32_avg   sse2/;
@@ -452,11 +454,11 @@ if (avm_config("CONFIG_AV2_ENCODER") eq "yes") {
   specialize qw/avm_highbd_sad4x64_avg   sse2/;
   specialize qw/avm_highbd_sad64x4_avg   sse2/;
 
-  specialize qw/avm_highbd_sad_skip_4x32   sse2/;
+  specialize qw/avm_highbd_sad_skip_4x32   avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_32x4   avx2 sse2/;
-  specialize qw/avm_highbd_sad_skip_8x64   sse2/;
+  specialize qw/avm_highbd_sad_skip_8x64   avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_64x8   avx2 sse2/;
-  specialize qw/avm_highbd_sad_skip_4x64   sse2/;
+  specialize qw/avm_highbd_sad_skip_4x64   avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_64x4   avx2 sse2/;
 
   #
@@ -501,10 +503,10 @@ if (avm_config("CONFIG_AV2_ENCODER") eq "yes") {
   specialize qw/avm_highbd_sad8x16x4d    sse2 avx2 neon/;
   specialize qw/avm_highbd_sad8x8x4d     sse2 avx2 neon/;
   specialize qw/avm_highbd_sad8x4x4d     sse2 avx2 neon/;
-  specialize qw/avm_highbd_sad4x8x4d     sse2 neon/;
-  specialize qw/avm_highbd_sad4x4x4d     sse2 neon/;
+  specialize qw/avm_highbd_sad4x8x4d     avx2 sse2 neon/;
+  specialize qw/avm_highbd_sad4x4x4d     avx2 sse2 neon/;
 
-  specialize qw/avm_highbd_sad4x16x4d         sse2 neon/;
+  specialize qw/avm_highbd_sad4x16x4d    avx2 sse2 neon/;
   specialize qw/avm_highbd_sad16x4x4d    avx2 sse2 neon/;
   specialize qw/avm_highbd_sad8x32x4d    avx2 sse2 neon/;
   specialize qw/avm_highbd_sad32x8x4d    avx2 sse2 neon/;
@@ -527,27 +529,29 @@ if (avm_config("CONFIG_AV2_ENCODER") eq "yes") {
   specialize qw/avm_highbd_sad_skip_16x8x4d    avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_8x16x4d    avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_8x8x4d     avx2 sse2/;
-  specialize qw/avm_highbd_sad_skip_4x8x4d          sse2/;
+  specialize qw/avm_highbd_sad_skip_8x4x4d     avx2/;
+  specialize qw/avm_highbd_sad_skip_4x8x4d     avx2 sse2/;
+  specialize qw/avm_highbd_sad_skip_4x4x4d     avx2/;
 
-  specialize qw/avm_highbd_sad_skip_4x16x4d         sse2/;
+  specialize qw/avm_highbd_sad_skip_4x16x4d    avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_16x4x4d         avx2/;
   specialize qw/avm_highbd_sad_skip_8x32x4d    avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_32x8x4d    avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_16x64x4d   avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_64x16x4d   avx2 sse2/;
 
-  specialize qw/avm_highbd_sad4x32x4d  sse2 neon/;
+  specialize qw/avm_highbd_sad4x32x4d  avx2 sse2 neon/;
   specialize qw/avm_highbd_sad32x4x4d  avx2 sse2 neon/;
   specialize qw/avm_highbd_sad8x64x4d  avx2 sse2 neon/;
   specialize qw/avm_highbd_sad64x8x4d  avx2 sse2 neon/;
-  specialize qw/avm_highbd_sad4x64x4d  sse2 neon/;
+  specialize qw/avm_highbd_sad4x64x4d  avx2 sse2 neon/;
   specialize qw/avm_highbd_sad64x4x4d  avx2 sse2 neon/;
 
-  specialize qw/avm_highbd_sad_skip_4x32x4d  sse2/;
+  specialize qw/avm_highbd_sad_skip_4x32x4d  avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_32x4x4d  avx2/;
   specialize qw/avm_highbd_sad_skip_8x64x4d  avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_64x8x4d  avx2 sse2/;
-  specialize qw/avm_highbd_sad_skip_4x64x4d  sse2/;
+  specialize qw/avm_highbd_sad_skip_4x64x4d  avx2 sse2/;
   specialize qw/avm_highbd_sad_skip_64x4x4d  avx2/;
 
   #

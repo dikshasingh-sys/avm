@@ -57,19 +57,34 @@ static AVM_FORCE_INLINE void highbd_sad16x4_core_ds_avx2(__m256i *s, __m256i *r,
 static AVM_FORCE_INLINE void highbd_sad16x4_core_avx2(__m256i *s, __m256i *r,
                                                       __m256i *sad_acc) {
   const __m256i ones = _mm256_set1_epi16(1);
-  int i;
-  __m256i res[4];
-  for (i = 0; i < 4; i++) {
-    res[i] = _mm256_sub_epi16(s[i], r[i]);
-    res[i] = _mm256_abs_epi16(res[i]);
-  }
+  const __m256i d0 = _mm256_abs_epi16(_mm256_sub_epi16(s[0], r[0]));
+  const __m256i d1 = _mm256_abs_epi16(_mm256_sub_epi16(s[1], r[1]));
+  const __m256i d2 = _mm256_abs_epi16(_mm256_sub_epi16(s[2], r[2]));
+  const __m256i d3 = _mm256_abs_epi16(_mm256_sub_epi16(s[3], r[3]));
+  const __m256i sum =
+      _mm256_add_epi16(_mm256_add_epi16(d0, d1), _mm256_add_epi16(d2, d3));
+  *sad_acc = _mm256_add_epi32(*sad_acc, _mm256_madd_epi16(sum, ones));
+}
 
-  res[0] = _mm256_add_epi16(res[0], res[1]);
-  res[0] = _mm256_add_epi16(res[0], res[2]);
-  res[0] = _mm256_add_epi16(res[0], res[3]);
-
-  const __m256i sad = _mm256_madd_epi16(res[0], ones);
-  *sad_acc = _mm256_add_epi32(*sad_acc, sad);
+static AVM_FORCE_INLINE void highbd_sad16x8_core_avx2(const __m256i *s,
+                                                      const __m256i *r,
+                                                      __m256i *sad_acc) {
+  const __m256i ones = _mm256_set1_epi16(1);
+  const __m256i d01 =
+      _mm256_add_epi16(_mm256_abs_epi16(_mm256_sub_epi16(s[0], r[0])),
+                       _mm256_abs_epi16(_mm256_sub_epi16(s[1], r[1])));
+  const __m256i d23 =
+      _mm256_add_epi16(_mm256_abs_epi16(_mm256_sub_epi16(s[2], r[2])),
+                       _mm256_abs_epi16(_mm256_sub_epi16(s[3], r[3])));
+  const __m256i d45 =
+      _mm256_add_epi16(_mm256_abs_epi16(_mm256_sub_epi16(s[4], r[4])),
+                       _mm256_abs_epi16(_mm256_sub_epi16(s[5], r[5])));
+  const __m256i d67 =
+      _mm256_add_epi16(_mm256_abs_epi16(_mm256_sub_epi16(s[6], r[6])),
+                       _mm256_abs_epi16(_mm256_sub_epi16(s[7], r[7])));
+  const __m256i sum =
+      _mm256_add_epi16(_mm256_add_epi16(d01, d23), _mm256_add_epi16(d45, d67));
+  *sad_acc = _mm256_add_epi32(*sad_acc, _mm256_madd_epi16(sum, ones));
 }
 
 static AVM_FORCE_INLINE void highbd_sad16x2_core_avx2(__m256i *s, __m256i *r,
@@ -563,19 +578,17 @@ static AVM_FORCE_INLINE void sad32x2(const uint16_t *src_ptr, int src_stride,
 
 static AVM_FORCE_INLINE void sad32x4_4d(__m256i *s, const uint16_t *ref_ptr,
                                         int ref_stride, __m256i *sad_acc) {
-  __m256i r[4];
-  int row_sections = 0;
-
-  while (row_sections < 2) {
-    r[0] = _mm256_loadu_si256((const __m256i *)ref_ptr);
-    r[1] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 16));
-    r[2] = _mm256_loadu_si256((const __m256i *)(ref_ptr + ref_stride));
-    r[3] = _mm256_loadu_si256((const __m256i *)(ref_ptr + ref_stride + 16));
-
-    highbd_sad16x4_core_avx2(s + 4 * row_sections, r, sad_acc);
-    row_sections += 1;
-    ref_ptr += ref_stride << 1;
-  }
+  __m256i r[8];
+  r[0] = _mm256_loadu_si256((const __m256i *)ref_ptr);
+  r[1] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 16));
+  r[2] = _mm256_loadu_si256((const __m256i *)(ref_ptr + ref_stride));
+  r[3] = _mm256_loadu_si256((const __m256i *)(ref_ptr + ref_stride + 16));
+  ref_ptr += ref_stride << 1;
+  r[4] = _mm256_loadu_si256((const __m256i *)ref_ptr);
+  r[5] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 16));
+  r[6] = _mm256_loadu_si256((const __m256i *)(ref_ptr + ref_stride));
+  r[7] = _mm256_loadu_si256((const __m256i *)(ref_ptr + ref_stride + 16));
+  highbd_sad16x8_core_avx2(s, r, sad_acc);
 }
 
 static AVM_FORCE_INLINE unsigned int avm_highbd_sad32xN_avx2(
@@ -642,17 +655,17 @@ static AVM_FORCE_INLINE void sad64x2(const uint16_t *src_ptr, int src_stride,
 
 static AVM_FORCE_INLINE void sad64x2_4d(__m256i *s, const uint16_t *ref_ptr,
                                         int ref_stride, __m256i *sad_acc) {
-  __m256i r[4];
-  int i;
-  for (i = 0; i < 2; i++) {
-    r[0] = _mm256_loadu_si256((const __m256i *)ref_ptr);
-    r[1] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 16));
-    r[2] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 32));
-    r[3] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 48));
-
-    highbd_sad16x4_core_avx2(s + 4 * i, r, sad_acc);
-    ref_ptr += ref_stride;
-  }
+  __m256i r[8];
+  r[0] = _mm256_loadu_si256((const __m256i *)ref_ptr);
+  r[1] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 16));
+  r[2] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 32));
+  r[3] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 48));
+  ref_ptr += ref_stride;
+  r[4] = _mm256_loadu_si256((const __m256i *)ref_ptr);
+  r[5] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 16));
+  r[6] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 32));
+  r[7] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 48));
+  highbd_sad16x8_core_avx2(s, r, sad_acc);
 }
 
 static AVM_FORCE_INLINE unsigned int avm_highbd_sad64xN_avx2(
@@ -705,20 +718,23 @@ static AVM_FORCE_INLINE unsigned int avm_highbd_sad64xN_avx2(
 MAKE_SAD_WX1(128);
 MAKE_SAD_WX1(256);
 
-#define MAKE_SAD_WX1_4D(w)                                        \
-  static AVM_FORCE_INLINE void sad##w##x1_4d(                     \
-      __m256i *s, const uint16_t *ref_ptr, __m256i *sad_acc) {    \
-    assert(w % 64 == 0);                                          \
-    __m256i r[4];                                                 \
-    int i;                                                        \
-    for (i = 0; i < w / 64; i++) {                                \
-      r[0] = _mm256_loadu_si256((const __m256i *)ref_ptr);        \
-      r[1] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 16)); \
-      r[2] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 32)); \
-      r[3] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 48)); \
-      highbd_sad16x4_core_avx2(s + i * 4, r, sad_acc);            \
-      ref_ptr += 64;                                              \
-    }                                                             \
+#define MAKE_SAD_WX1_4D(w)                                         \
+  static AVM_FORCE_INLINE void sad##w##x1_4d(                      \
+      __m256i *s, const uint16_t *ref_ptr, __m256i *sad_acc) {     \
+    assert(w % 128 == 0);                                          \
+    __m256i r[8];                                                  \
+    for (int i = 0; i < w / 128; i++) {                            \
+      r[0] = _mm256_loadu_si256((const __m256i *)ref_ptr);         \
+      r[1] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 16));  \
+      r[2] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 32));  \
+      r[3] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 48));  \
+      r[4] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 64));  \
+      r[5] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 80));  \
+      r[6] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 96));  \
+      r[7] = _mm256_loadu_si256((const __m256i *)(ref_ptr + 112)); \
+      highbd_sad16x8_core_avx2(s + i * 8, r, sad_acc);             \
+      ref_ptr += 128;                                              \
+    }                                                              \
   }
 
 MAKE_SAD_WX1_4D(128);
@@ -783,6 +799,104 @@ static AVM_FORCE_INLINE unsigned int avm_highbd_sad256xN_avx2(
                                                 ref, 2 * ref_stride);         \
   }
 
+static AVM_FORCE_INLINE unsigned int avm_highbd_sad4xN_avx2(int num_rows,
+                                                            const uint16_t *src,
+                                                            int src_stride,
+                                                            const uint16_t *ref,
+                                                            int ref_stride) {
+  const __m256i ones = _mm256_set1_epi16(1);
+  if (num_rows == 2) {
+    const __m128i s01 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)src),
+        _mm_loadl_epi64((const __m128i *)(src + src_stride)));
+    const __m128i r01 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)ref),
+        _mm_loadl_epi64((const __m128i *)(ref + ref_stride)));
+    __m128i sum = _mm_madd_epi16(_mm_abs_epi16(_mm_sub_epi16(s01, r01)),
+                                 _mm_set1_epi16(1));
+    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 8));
+    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 4));
+    return (unsigned int)_mm_cvtsi128_si32(sum);
+  }
+  __m256i sad = _mm256_setzero_si256();
+  for (int r = 0; r < num_rows; r += 4) {
+    const __m128i s01 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)src),
+        _mm_loadl_epi64((const __m128i *)(src + src_stride)));
+    const __m128i s23 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)(src + 2 * src_stride)),
+        _mm_loadl_epi64((const __m128i *)(src + 3 * src_stride)));
+    const __m128i r01 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)ref),
+        _mm_loadl_epi64((const __m128i *)(ref + ref_stride)));
+    const __m128i r23 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)(ref + 2 * ref_stride)),
+        _mm_loadl_epi64((const __m128i *)(ref + 3 * ref_stride)));
+    const __m256i s0123 =
+        _mm256_inserti128_si256(_mm256_castsi128_si256(s01), s23, 1);
+    const __m256i r0123 =
+        _mm256_inserti128_si256(_mm256_castsi128_si256(r01), r23, 1);
+    sad = _mm256_add_epi32(
+        sad, _mm256_madd_epi16(_mm256_abs_epi16(_mm256_sub_epi16(s0123, r0123)),
+                               ones));
+    src += 4 * src_stride;
+    ref += 4 * ref_stride;
+  }
+  return get_sad_from_mm256_epi32(&sad);
+}
+
+static AVM_FORCE_INLINE unsigned int avm_highbd_sad8xN_avx2(int num_rows,
+                                                            const uint16_t *src,
+                                                            int src_stride,
+                                                            const uint16_t *ref,
+                                                            int ref_stride) {
+  if (num_rows == 2) {
+    const __m256i s01 = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)src)),
+        _mm_loadu_si128((const __m128i *)(src + src_stride)), 1);
+    const __m256i r01 = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)ref)),
+        _mm_loadu_si128((const __m128i *)(ref + ref_stride)), 1);
+    const __m256i sad = _mm256_madd_epi16(
+        _mm256_abs_epi16(_mm256_sub_epi16(s01, r01)), _mm256_set1_epi16(1));
+    return get_sad_from_mm256_epi32(&sad);
+  }
+  __m256i sad = _mm256_setzero_si256();
+  for (int r = 0; r < num_rows; r += 4) {
+    __m256i s[2], rv[2];
+    s[0] = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)src)),
+        _mm_loadu_si128((const __m128i *)(src + src_stride)), 1);
+    s[1] = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(
+            _mm_loadu_si128((const __m128i *)(src + 2 * src_stride))),
+        _mm_loadu_si128((const __m128i *)(src + 3 * src_stride)), 1);
+    rv[0] = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)ref)),
+        _mm_loadu_si128((const __m128i *)(ref + ref_stride)), 1);
+    rv[1] = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(
+            _mm_loadu_si128((const __m128i *)(ref + 2 * ref_stride))),
+        _mm_loadu_si128((const __m128i *)(ref + 3 * ref_stride)), 1);
+    highbd_sad16x2_core_avx2(s, rv, &sad);
+    src += 4 * src_stride;
+    ref += 4 * ref_stride;
+  }
+  return get_sad_from_mm256_epi32(&sad);
+}
+
+highbd_sadMxN_avx2(4, 4);
+highbd_sadMxN_avx2(4, 8);
+highbd_sadMxN_avx2(4, 16);
+highbd_sadMxN_avx2(4, 32);
+highbd_sadMxN_avx2(4, 64);
+
+highbd_sadMxN_avx2(8, 4);
+highbd_sadMxN_avx2(8, 8);
+highbd_sadMxN_avx2(8, 16);
+highbd_sadMxN_avx2(8, 32);
+highbd_sadMxN_avx2(8, 64);
+
 highbd_sadMxN_avx2(16, 4);
 highbd_sadMxN_avx2(16, 8);
 highbd_sadMxN_avx2(16, 16);
@@ -822,6 +936,18 @@ highbd_sadMxN_avx2(128, 256);
 
 highbd_sadMxN_avx2(256, 128);
 highbd_sadMxN_avx2(256, 256);
+
+highbd_sad_skip_MxN_avx2(4, 4);
+highbd_sad_skip_MxN_avx2(4, 8);
+highbd_sad_skip_MxN_avx2(4, 16);
+highbd_sad_skip_MxN_avx2(4, 32);
+highbd_sad_skip_MxN_avx2(4, 64);
+
+highbd_sad_skip_MxN_avx2(8, 4);
+highbd_sad_skip_MxN_avx2(8, 8);
+highbd_sad_skip_MxN_avx2(8, 16);
+highbd_sad_skip_MxN_avx2(8, 32);
+highbd_sad_skip_MxN_avx2(8, 64);
 
 highbd_sad_skip_MxN_2rows_avx2(16, 4);
 highbd_sad_skip_MxN_avx2(16, 8);
@@ -1118,43 +1244,14 @@ unsigned int avm_highbd_sad256x256_avg_avx2(const uint16_t *src, int src_stride,
 }
 
 // SAD 4D
-// Combine 4 __m256i input vectors  v to uint32_t result[4]
+// Combine 4 __m256i input vectors v to uint32_t result[4]
 static AVM_FORCE_INLINE void get_4d_sad_from_mm256_epi32(const __m256i *v,
                                                          uint32_t *res) {
-  __m256i u0, u1, u2, u3;
-  const __m256i mask = yy_set1_64_from_32i(UINT32_MAX);
-  __m128i sad;
-
-  // 8 32-bit summation
-  u0 = _mm256_srli_si256(v[0], 4);
-  u1 = _mm256_srli_si256(v[1], 4);
-  u2 = _mm256_srli_si256(v[2], 4);
-  u3 = _mm256_srli_si256(v[3], 4);
-
-  u0 = _mm256_add_epi32(u0, v[0]);
-  u1 = _mm256_add_epi32(u1, v[1]);
-  u2 = _mm256_add_epi32(u2, v[2]);
-  u3 = _mm256_add_epi32(u3, v[3]);
-
-  u0 = _mm256_and_si256(u0, mask);
-  u1 = _mm256_and_si256(u1, mask);
-  u2 = _mm256_and_si256(u2, mask);
-  u3 = _mm256_and_si256(u3, mask);
-  // 4 32-bit summation, evenly positioned
-
-  u1 = _mm256_slli_si256(u1, 4);
-  u3 = _mm256_slli_si256(u3, 4);
-
-  u0 = _mm256_or_si256(u0, u1);
-  u2 = _mm256_or_si256(u2, u3);
-  // 8 32-bit summation, interleaved
-
-  u1 = _mm256_unpacklo_epi64(u0, u2);
-  u3 = _mm256_unpackhi_epi64(u0, u2);
-
-  u0 = _mm256_add_epi32(u1, u3);
-  sad = _mm_add_epi32(_mm256_extractf128_si256(u0, 1),
-                      _mm256_castsi256_si128(u0));
+  const __m256i sum01 = _mm256_hadd_epi32(v[0], v[1]);
+  const __m256i sum23 = _mm256_hadd_epi32(v[2], v[3]);
+  const __m256i sum0123 = _mm256_hadd_epi32(sum01, sum23);
+  const __m128i sad = _mm_add_epi32(_mm256_castsi256_si128(sum0123),
+                                    _mm256_extracti128_si256(sum0123, 1));
   _mm_storeu_si128((__m128i *)res, sad);
 }
 
@@ -1165,14 +1262,80 @@ static AVM_FORCE_INLINE void init_sad(__m256i *s) {
   s[3] = _mm256_setzero_si256();
 }
 
+static AVM_FORCE_INLINE void avm_highbd_sad4xNx4d_avx2(
+    int num_rows, const uint16_t *src, int src_stride,
+    const uint16_t *const ref_array[], int ref_stride, uint32_t *sad_array) {
+  const __m256i ones = _mm256_set1_epi16(1);
+  __m256i acc01 = _mm256_setzero_si256();
+  __m256i acc23 = _mm256_setzero_si256();
+  const uint16_t *ref0 = ref_array[0];
+  const uint16_t *ref1 = ref_array[1];
+  const uint16_t *ref2 = ref_array[2];
+  const uint16_t *ref3 = ref_array[3];
+
+  for (int row = 0; row < num_rows; row += 2) {
+    const __m128i s01 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)src),
+        _mm_loadl_epi64((const __m128i *)(src + src_stride)));
+    const __m256i src_dup = _mm256_broadcastsi128_si256(s01);
+    const __m128i r0 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)ref0),
+        _mm_loadl_epi64((const __m128i *)(ref0 + ref_stride)));
+    const __m128i r1 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)ref1),
+        _mm_loadl_epi64((const __m128i *)(ref1 + ref_stride)));
+    const __m128i r2 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)ref2),
+        _mm_loadl_epi64((const __m128i *)(ref2 + ref_stride)));
+    const __m128i r3 = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)ref3),
+        _mm_loadl_epi64((const __m128i *)(ref3 + ref_stride)));
+    const __m256i r01 =
+        _mm256_inserti128_si256(_mm256_castsi128_si256(r0), r1, 1);
+    const __m256i r23 =
+        _mm256_inserti128_si256(_mm256_castsi128_si256(r2), r3, 1);
+    acc01 = _mm256_add_epi32(
+        acc01, _mm256_madd_epi16(
+                   _mm256_abs_epi16(_mm256_sub_epi16(src_dup, r01)), ones));
+    acc23 = _mm256_add_epi32(
+        acc23, _mm256_madd_epi16(
+                   _mm256_abs_epi16(_mm256_sub_epi16(src_dup, r23)), ones));
+    src += 2 * src_stride;
+    ref0 += 2 * ref_stride;
+    ref1 += 2 * ref_stride;
+    ref2 += 2 * ref_stride;
+    ref3 += 2 * ref_stride;
+  }
+  const __m256i h0 = _mm256_hadd_epi32(acc01, acc23);
+  const __m256i h1 = _mm256_hadd_epi32(h0, h0);
+  const __m128i res = _mm_unpacklo_epi32(_mm256_castsi256_si128(h1),
+                                         _mm256_extracti128_si256(h1, 1));
+  _mm_storeu_si128((__m128i *)sad_array, res);
+}
+
 static AVM_FORCE_INLINE void avm_highbd_sad8xNx4d_avx2(
     int N, const uint16_t *src, int src_stride,
     const uint16_t *const ref_array[], int ref_stride, uint32_t *sad_array) {
   __m256i sad_vec[4];
+  init_sad(sad_vec);
+  if (N == 2) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i s01 = _mm256_inserti128_si256(
+        _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)src)),
+        _mm_loadu_si128((const __m128i *)(src + src_stride)), 1);
+    for (int i = 0; i < 4; ++i) {
+      const __m256i r01 = _mm256_inserti128_si256(
+          _mm256_castsi128_si256(
+              _mm_loadu_si128((const __m128i *)ref_array[i])),
+          _mm_loadu_si128((const __m128i *)(ref_array[i] + ref_stride)), 1);
+      sad_vec[i] =
+          _mm256_madd_epi16(_mm256_abs_epi16(_mm256_sub_epi16(s01, r01)), ones);
+    }
+    get_4d_sad_from_mm256_epi32(sad_vec, sad_array);
+    return;
+  }
   __m256i s[2];
   int i, j;
-
-  init_sad(sad_vec);
 
   const uint16_t *src16 = src;
   for (j = 0; j < N; j += 4) {
@@ -1411,6 +1574,12 @@ static AVM_FORCE_INLINE void avm_highbd_sad256xNx4d_avx2(
     sad_array[3] <<= 1;                                                        \
   }
 
+highbd_sadMxNx4d_avx2(4, 4);
+highbd_sadMxNx4d_avx2(4, 8);
+highbd_sadMxNx4d_avx2(4, 16);
+highbd_sadMxNx4d_avx2(4, 32);
+highbd_sadMxNx4d_avx2(4, 64);
+
 highbd_sadMxNx4d_avx2(8, 4);
 highbd_sadMxNx4d_avx2(8, 8);
 highbd_sadMxNx4d_avx2(8, 16);
@@ -1443,6 +1612,13 @@ highbd_sadMxNx4d_avx2(128, 256);
 highbd_sadMxNx4d_avx2(256, 128);
 highbd_sadMxNx4d_avx2(256, 256);
 
+highbd_sad_skip_MxNx4d_avx2(4, 4);
+highbd_sad_skip_MxNx4d_avx2(4, 8);
+highbd_sad_skip_MxNx4d_avx2(4, 16);
+highbd_sad_skip_MxNx4d_avx2(4, 32);
+highbd_sad_skip_MxNx4d_avx2(4, 64);
+
+highbd_sad_skip_MxNx4d_avx2(8, 4);
 highbd_sad_skip_MxNx4d_avx2(8, 8);
 highbd_sad_skip_MxNx4d_avx2(8, 16);
 highbd_sad_skip_MxNx4d_avx2(8, 32);

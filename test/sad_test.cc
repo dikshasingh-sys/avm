@@ -2525,6 +2525,9 @@ INSTANTIATE_TEST_SUITE_P(SSE2, SADSkipx4Test,
 #endif  // HAVE_SSE2
 
 #if HAVE_AVX2
+#define MAKE_SAD_AVX2_BDPARAMS(w, h, fn) \
+  make_tuple(w, h, &fn, 8), make_tuple(w, h, &fn, 10), make_tuple(w, h, &fn, 12)
+
 const SadMxNParam avx2_tests[] = {
   make_tuple(256, 256, &avm_highbd_sad256x256_avx2, 8),
   make_tuple(256, 128, &avm_highbd_sad256x128_avx2, 8),
@@ -2606,6 +2609,16 @@ const SadMxNParam avx2_tests[] = {
   make_tuple(64, 4, &avm_highbd_sad64x4_avx2, 12),
   make_tuple(64, 8, &avm_highbd_sad64x8_avx2, 12),
   make_tuple(32, 4, &avm_highbd_sad32x4_avx2, 12),
+  MAKE_SAD_AVX2_BDPARAMS(4, 4, avm_highbd_sad4x4_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 8, avm_highbd_sad4x8_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 16, avm_highbd_sad4x16_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 32, avm_highbd_sad4x32_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 64, avm_highbd_sad4x64_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 4, avm_highbd_sad8x4_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 8, avm_highbd_sad8x8_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 16, avm_highbd_sad8x16_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 32, avm_highbd_sad8x32_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 64, avm_highbd_sad8x64_avx2),
 };
 INSTANTIATE_TEST_SUITE_P(AVX2, SADTest, ::testing::ValuesIn(avx2_tests));
 
@@ -2685,6 +2698,16 @@ const SadSkipMxNParam skip_avx2_tests[] = {
   make_tuple(64, 4, &avm_highbd_sad_skip_64x4_avx2, 12),
   make_tuple(64, 8, &avm_highbd_sad_skip_64x8_avx2, 12),
   make_tuple(32, 4, &avm_highbd_sad_skip_32x4_avx2, 12),
+  MAKE_SAD_AVX2_BDPARAMS(4, 4, avm_highbd_sad_skip_4x4_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 8, avm_highbd_sad_skip_4x8_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 16, avm_highbd_sad_skip_4x16_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 32, avm_highbd_sad_skip_4x32_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 64, avm_highbd_sad_skip_4x64_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 4, avm_highbd_sad_skip_8x4_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 8, avm_highbd_sad_skip_8x8_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 16, avm_highbd_sad_skip_8x16_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 32, avm_highbd_sad_skip_8x32_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 64, avm_highbd_sad_skip_8x64_avx2),
 };
 INSTANTIATE_TEST_SUITE_P(AVX2, SADSkipTest,
                          ::testing::ValuesIn(skip_avx2_tests));
@@ -2831,6 +2854,12 @@ const SadSkipMxNx4Param skip_x4d_avx2_tests[] = {
   make_tuple(64, 8, &avm_highbd_sad_skip_64x8x4d_avx2, 12),
   make_tuple(8, 64, &avm_highbd_sad_skip_8x64x4d_avx2, 12),
   make_tuple(32, 4, &avm_highbd_sad_skip_32x4x4d_avx2, 12),
+  MAKE_SAD_AVX2_BDPARAMS(4, 4, avm_highbd_sad_skip_4x4x4d_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 8, avm_highbd_sad_skip_4x8x4d_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 16, avm_highbd_sad_skip_4x16x4d_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 32, avm_highbd_sad_skip_4x32x4d_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 64, avm_highbd_sad_skip_4x64x4d_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(8, 4, avm_highbd_sad_skip_8x4x4d_avx2),
 };
 INSTANTIATE_TEST_SUITE_P(AVX2, SADSkipx4Test,
                          ::testing::ValuesIn(skip_x4d_avx2_tests));
@@ -2919,7 +2948,13 @@ const SadMxNx4Param x4d_avx2_tests[] = {
   make_tuple(64, 8, &avm_highbd_sad64x8x4d_avx2, 12),
   make_tuple(8, 64, &avm_highbd_sad8x64x4d_avx2, 12),
   make_tuple(32, 4, &avm_highbd_sad32x4x4d_avx2, 12),
+  MAKE_SAD_AVX2_BDPARAMS(4, 4, avm_highbd_sad4x4x4d_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 8, avm_highbd_sad4x8x4d_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 16, avm_highbd_sad4x16x4d_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 32, avm_highbd_sad4x32x4d_avx2),
+  MAKE_SAD_AVX2_BDPARAMS(4, 64, avm_highbd_sad4x64x4d_avx2),
 };
+#undef MAKE_SAD_AVX2_BDPARAMS
 INSTANTIATE_TEST_SUITE_P(AVX2, SADx4Test, ::testing::ValuesIn(x4d_avx2_tests));
 #endif  // HAVE_AVX2
 
