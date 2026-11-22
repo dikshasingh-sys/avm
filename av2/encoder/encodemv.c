@@ -523,57 +523,79 @@ void av2_build_vq_nmv_cost_table(MvCosts *mv_costs, const nmv_context *ctx,
   }
 
   // Precompute all possible shell cost
-  for (int shell_index = 0; shell_index <= max_shell_idx; shell_index++) {
-    shell_cost[shell_index] = 0;
+  const int check_num_mv_class = get_default_num_shell_class(precision);
+  int num_mv_class_0, num_mv_class_1;
+  split_num_shell_class(check_num_mv_class, &num_mv_class_0, &num_mv_class_1);
+
+  const int max_low_shell_idx = AVMMIN(max_shell_idx, 7);
+  for (int shell_index = 0; shell_index <= max_low_shell_idx; shell_index++) {
     int shell_cls_offset;
     const int shell_class =
         get_shell_class_with_precision(shell_index, &shell_cls_offset);
-    const int check_num_mv_class = get_default_num_shell_class(precision);
-    int num_mv_class_0, num_mv_class_1;
-    split_num_shell_class(check_num_mv_class, &num_mv_class_0, &num_mv_class_1);
-    if (shell_class < num_mv_class_0) {
-      shell_cost[shell_index] += joint_shell_set_cost[0];
-      shell_cost[shell_index] += joint_shell_class_cost_0[shell_class];
+    assert(shell_class >= 0 && shell_class < num_mv_class);
+    int cost =
+        (shell_class < num_mv_class_0)
+            ? joint_shell_set_cost[0] + joint_shell_class_cost_0[shell_class]
+            : joint_shell_set_cost[1] +
+                  joint_shell_class_cost_1[shell_class - num_mv_class_0];
+    if (shell_class < 2) {
+      assert(shell_cls_offset == 0 || shell_cls_offset == 1);
+      cost += shell_offset_low_class_cost[shell_class][shell_cls_offset];
     } else {
-      shell_cost[shell_index] += joint_shell_set_cost[1];
+      for (int bit_idx = 0; bit_idx < 3; ++bit_idx) {
+        cost += bit_idx ? av2_cost_literal(1)
+                        : shell_offset_class2_cost[shell_cls_offset != bit_idx];
+        if (shell_cls_offset == bit_idx) break;
+      }
+    }
+    shell_cost[shell_index] = cost;
+  }
+
+  for (int shell_class = 3; (1 << shell_class) <= max_shell_idx;
+       ++shell_class) {
+    assert(shell_class < num_mv_class);
+    assert(shell_class <= SHELL_INT_OFFSET_BIT);
+    int shell_class_cost;
+    if (shell_class < num_mv_class_0) {
+      shell_class_cost =
+          joint_shell_set_cost[0] + joint_shell_class_cost_0[shell_class];
+    } else {
+      shell_class_cost = joint_shell_set_cost[1];
       if (precision == MV_PRECISION_ONE_EIGHTH_PEL) {
         const int map_shell_class = get_map_shell_class(shell_class);
-        shell_cost[shell_index] +=
+        shell_class_cost +=
             joint_shell_class_cost_1[map_shell_class - num_mv_class_0];
         if (shell_class >= MAX_NUM_SHELL_CLASS - 2) {
           const int is_last_class = (shell_class == MAX_NUM_SHELL_CLASS - 1);
-          shell_cost[shell_index] +=
-              joint_shell_last_two_classes_cost[is_last_class];
+          shell_class_cost += joint_shell_last_two_classes_cost[is_last_class];
         }
       } else {
-        shell_cost[shell_index] +=
+        shell_class_cost +=
             joint_shell_class_cost_1[shell_class - num_mv_class_0];
       }
     }
-    assert(shell_class >= 0 && shell_class < num_mv_class);
 
-    // Shell offset cost
-    if (shell_class < 2) {
-      assert(shell_cls_offset == 0 || shell_cls_offset == 1);
-      shell_cost[shell_index] +=
-          shell_offset_low_class_cost[shell_class][shell_cls_offset];
+    int zero_offset_cost = 0;
+    for (int bit_idx = 0; bit_idx < shell_class; ++bit_idx) {
+      zero_offset_cost += shell_offset_other_class_cost[0][bit_idx][0];
+    }
 
-    } else if (shell_class == 2) {
-      int max_idx_bits = 3;
-      int coded_value = shell_cls_offset;
-      for (int bit_idx = 0; bit_idx < max_idx_bits; ++bit_idx) {
-        shell_cost[shell_index] +=
-            bit_idx ? av2_cost_literal(1)
-                    : shell_offset_class2_cost[coded_value != bit_idx];
+    const int base_shell_idx = 1 << shell_class;
+    const int num_offsets =
+        AVMMIN(base_shell_idx, max_shell_idx - base_shell_idx + 1);
+    int *const class_shell_cost = shell_cost + base_shell_idx;
+    class_shell_cost[0] = shell_class_cost + zero_offset_cost;
 
-        if (coded_value == bit_idx) break;
-      }
-    } else {
-      const int num_of_bits_for_this_offset = shell_class;
-      assert(num_of_bits_for_this_offset <= SHELL_INT_OFFSET_BIT);
-      for (int i = 0; i < num_of_bits_for_this_offset; ++i) {
-        shell_cost[shell_index] +=
-            shell_offset_other_class_cost[0][i][(shell_cls_offset >> i) & 1];
+    for (int bit_idx = 0; bit_idx < shell_class; ++bit_idx) {
+      const int bit_offset = 1 << bit_idx;
+      if (bit_offset >= num_offsets) break;
+      const int num_new_offsets = AVMMIN(bit_offset, num_offsets - bit_offset);
+      const int bit1_cost_diff = shell_offset_other_class_cost[0][bit_idx][1] -
+                                 shell_offset_other_class_cost[0][bit_idx][0];
+      const int *restrict bit0_costs = class_shell_cost;
+      int *restrict bit1_costs = class_shell_cost + bit_offset;
+      for (int offset = 0; offset < num_new_offsets; ++offset) {
+        bit1_costs[offset] = bit0_costs[offset] + bit1_cost_diff;
       }
     }
   }

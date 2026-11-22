@@ -231,7 +231,7 @@ static AVM_INLINE void model_rd_for_sb_with_curvfit(
         get_visible_dimensions(xd, plane, 0, 0, block_width, block_height,
                                cm->width, cm->height, &bw, &bh);
     const int shift = xd->bd - 8;
-    if (!is_border_block)
+    if (!is_border_block || (bw >= 4 && bh >= 4 && !(bw & 3) && !(bh & 3)))
       sse = avm_highbd_sse(p->src.buf, p->src.stride, pd->dst.buf,
                            pd->dst.stride, bw, bh);
     else
