@@ -3106,6 +3106,33 @@ int upsampled_pref_error(MACROBLOCKD *xd, const AV2_COMMON *cm,
   const int is_scaled_ref =
       ms_buffers->src->width == ms_buffers->ref->crop_width &&
       ms_buffers->src->height == ms_buffers->ref->crop_height;
+  const MB_MODE_INFO *const mi = xd->mi[0];
+  const int is_intrabc = is_intrabc_block(mi, xd->tree_type);
+  const struct scale_factors *const sf = (is_intrabc || is_scaled_ref)
+                                             ? &cm->sf_identity
+                                             : xd->block_ref_scale_factors[0];
+
+  if (!av2_is_scaled(sf) && mask == NULL &&
+      (second_pred == NULL || get_cwp_idx(mi) == CWP_EQUAL)) {
+    if (!subpel_x_q3 && !subpel_y_q3) {
+      return second_pred == NULL
+                 ? vfp->vf(ref, ref_stride, src, src_stride, sse)
+                 : vfp->svaf(ref, ref_stride, 0, 0, src, src_stride, sse,
+                             second_pred);
+    }
+    if (subpel_search_type == USE_2_TAPS) {
+      return second_pred == NULL
+                 ? vfp->svf(ref, ref_stride, subpel_x_q3, subpel_y_q3, src,
+                            src_stride, sse)
+                 : vfp->svaf(ref, ref_stride, subpel_x_q3, subpel_y_q3, src,
+                             src_stride, sse, second_pred);
+    }
+    if (subpel_search_type == USE_4_TAPS && w >= 4) {
+      return avm_highbd_upsampled_pred_4tap_var(
+          ref, ref_stride, second_pred, src, src_stride, w, h, subpel_x_q3,
+          subpel_y_q3, xd->bd, sse);
+    }
+  }
 
   if (second_pred != NULL) {
     if (mask) {
@@ -3433,14 +3460,19 @@ static unsigned int setup_center_error(
   unsigned int besterr;
 
   if (second_pred != NULL) {
-    DECLARE_ALIGNED(16, uint16_t, comp_pred[MAX_SB_SQUARE]);
-    if (mask) {
-      avm_highbd_comp_mask_pred(comp_pred, second_pred, w, h, y, y_stride, mask,
-                                mask_stride, invert_mask);
+    if (mask || w < 4) {
+      DECLARE_ALIGNED(16, uint16_t, comp_pred[MAX_SB_SQUARE]);
+      if (mask) {
+        avm_highbd_comp_mask_pred(comp_pred, second_pred, w, h, y, y_stride,
+                                  mask, mask_stride, invert_mask);
+      } else {
+        avm_highbd_comp_avg_pred(comp_pred, second_pred, w, h, y, y_stride);
+      }
+      besterr = vfp->vf(comp_pred, w, src, src_stride, sse1);
     } else {
-      avm_highbd_comp_avg_pred(comp_pred, second_pred, w, h, y, y_stride);
+      besterr =
+          vfp->svaf(y, y_stride, 0, 0, src, src_stride, sse1, second_pred);
     }
-    besterr = vfp->vf(comp_pred, w, src, src_stride, sse1);
   } else {
     besterr = vfp->vf(y, y_stride, src, src_stride, sse1);
   }

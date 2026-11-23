@@ -361,6 +361,143 @@ INSTANTIATE_TEST_SUITE_P(
                        ::testing::Range(8, 13, 2)));
 #endif
 
+#if HAVE_AVX2
+typedef uint32_t (*highbd_upsampled_pred_4tap_var_func)(
+    const uint16_t *ref, int ref_stride, const uint16_t *second_pred,
+    const uint16_t *src, int src_stride, int width, int height, int subpel_x_q3,
+    int subpel_y_q3, int bd, uint32_t *sse);
+
+typedef std::tuple<highbd_upsampled_pred_4tap_var_func, BLOCK_SIZE, int>
+    UpsampledPred4TapVarParam;
+
+class AV2HighbdUpsampledPred4TapVarTest
+    : public ::testing::TestWithParam<UpsampledPred4TapVarParam> {
+ protected:
+  void SetUp() override {
+    rnd_.Reset(libavm_test::ACMRandom::DeterministicSeed());
+    src_ = (uint16_t *)avm_memalign(32, MAX_SB_SQUARE * sizeof(*src_));
+    sec_ = (uint16_t *)avm_memalign(32, MAX_SB_SQUARE * sizeof(*sec_));
+    ref_buf_ = (uint16_t *)avm_memalign(
+        32, (MAX_SB_SQUARE + 16 * MAX_SB_SIZE) * sizeof(*ref_buf_));
+    ref_ = ref_buf_ + 8 * MAX_SB_SIZE;
+  }
+  void TearDown() override {
+    avm_free(src_);
+    avm_free(sec_);
+    avm_free(ref_buf_);
+    libavm_test::ClearSystemState();
+  }
+
+  libavm_test::ACMRandom rnd_;
+  uint16_t *src_;
+  uint16_t *sec_;
+  uint16_t *ref_buf_;
+  uint16_t *ref_;
+};
+
+TEST_P(AV2HighbdUpsampledPred4TapVarTest, CheckOutput) {
+  const highbd_upsampled_pred_4tap_var_func test_fn = GET_PARAM(0);
+  const BLOCK_SIZE bsize = GET_PARAM(1);
+  const int bd = GET_PARAM(2);
+  const int w = block_size_wide[bsize];
+  const int h = block_size_high[bsize];
+  const uint16_t mask = (1 << bd) - 1;
+
+  for (int i = 0; i < MAX_SB_SQUARE; ++i) {
+    src_[i] = rnd_.Rand16() & mask;
+    sec_[i] = rnd_.Rand16() & mask;
+  }
+  for (int i = 0; i < MAX_SB_SQUARE + 16 * MAX_SB_SIZE; ++i) {
+    ref_buf_[i] = rnd_.Rand16() & mask;
+  }
+
+  for (int use_sec = 0; use_sec <= 1; ++use_sec) {
+    const uint16_t *sec_ptr = use_sec ? sec_ : nullptr;
+    for (int sub = 0; sub < 64; ++sub) {
+      const int subx = sub & 7;
+      const int suby = sub >> 3;
+      uint32_t sse_ref = 0, sse_tst = 0;
+      const uint32_t var_ref = avm_highbd_upsampled_pred_4tap_var_c(
+          ref_, MAX_SB_SIZE, sec_ptr, src_, MAX_SB_SIZE, w, h, subx, suby, bd,
+          &sse_ref);
+      const uint32_t var_tst =
+          test_fn(ref_, MAX_SB_SIZE, sec_ptr, src_, MAX_SB_SIZE, w, h, subx,
+                  suby, bd, &sse_tst);
+      ASSERT_EQ(sse_ref, sse_tst)
+          << "w=" << w << " h=" << h << " bd=" << bd << " sec=" << use_sec
+          << " sub=(" << subx << "," << suby << ")";
+      ASSERT_EQ(var_ref, var_tst)
+          << "w=" << w << " h=" << h << " bd=" << bd << " sec=" << use_sec
+          << " sub=(" << subx << "," << suby << ")";
+    }
+  }
+}
+
+TEST_P(AV2HighbdUpsampledPred4TapVarTest, DISABLED_Speed) {
+  const highbd_upsampled_pred_4tap_var_func test_fn = GET_PARAM(0);
+  const BLOCK_SIZE bsize = GET_PARAM(1);
+  const int bd = GET_PARAM(2);
+  const int w = block_size_wide[bsize];
+  const int h = block_size_high[bsize];
+  const uint16_t mask = (1 << bd) - 1;
+
+  for (int i = 0; i < MAX_SB_SQUARE; ++i) {
+    src_[i] = rnd_.Rand16() & mask;
+    sec_[i] = rnd_.Rand16() & mask;
+  }
+  for (int i = 0; i < MAX_SB_SQUARE + 16 * MAX_SB_SIZE; ++i) {
+    ref_buf_[i] = rnd_.Rand16() & mask;
+  }
+
+  const int num_loops = AVMMAX(100, 20000000 / (w * h));
+  uint32_t sse = 0;
+  volatile uint32_t sink = 0;
+  for (int use_sec = 0; use_sec <= 1; ++use_sec) {
+    const uint16_t *sec_ptr = use_sec ? sec_ : nullptr;
+    avm_usec_timer timer_c, timer_simd;
+
+    avm_usec_timer_start(&timer_c);
+    for (int iter = 0; iter < num_loops; ++iter) {
+      const int sub = (iter & 63);
+      sink += avm_highbd_upsampled_pred_4tap_var_c(ref_, MAX_SB_SIZE, sec_ptr,
+                                                   src_, MAX_SB_SIZE, w, h,
+                                                   sub & 7, sub >> 3, bd, &sse);
+    }
+    avm_usec_timer_mark(&timer_c);
+    const double time_c = static_cast<double>(avm_usec_timer_elapsed(&timer_c));
+
+    avm_usec_timer_start(&timer_simd);
+    for (int iter = 0; iter < num_loops; ++iter) {
+      const int sub = (iter & 63);
+      sink += test_fn(ref_, MAX_SB_SIZE, sec_ptr, src_, MAX_SB_SIZE, w, h,
+                      sub & 7, sub >> 3, bd, &sse);
+    }
+    avm_usec_timer_mark(&timer_simd);
+    (void)sink;
+    const double time_simd =
+        static_cast<double>(avm_usec_timer_elapsed(&timer_simd));
+
+    printf("UpsampledPred4TapVar[sec=%d] %3dx%-3d bd:%d: %.2f/%.2fus (%.2fx)\n",
+           use_sec, w, h, bd, time_c, time_simd, time_c / time_simd);
+  }
+}
+
+const BLOCK_SIZE kValid4TapVarBlockSize[] = {
+  BLOCK_4X4,    BLOCK_4X8,    BLOCK_8X4,     BLOCK_8X8,   BLOCK_8X16,
+  BLOCK_8X32,   BLOCK_16X8,   BLOCK_16X16,   BLOCK_16X32, BLOCK_32X8,
+  BLOCK_32X16,  BLOCK_32X32,  BLOCK_32X64,   BLOCK_64X32, BLOCK_64X64,
+  BLOCK_64X128, BLOCK_128X64, BLOCK_128X128, BLOCK_16X64, BLOCK_64X16,
+  BLOCK_256X256
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    AVX2, AV2HighbdUpsampledPred4TapVarTest,
+    ::testing::Combine(
+        ::testing::Values(&avm_highbd_upsampled_pred_4tap_var_avx2),
+        ::testing::ValuesIn(kValid4TapVarBlockSize),
+        ::testing::Range(8, 13, 2)));
+#endif
+
 #ifndef avm_highbd_comp_mask_pred
 // can't run this test if avm_highbd_comp_mask_pred is defined to
 // avm_highbd_comp_mask_pred_c

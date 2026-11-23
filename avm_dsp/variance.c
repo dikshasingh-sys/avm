@@ -583,6 +583,119 @@ void avm_highbd_comp_avg_upsampled_pred_c(
   }
 }
 
+uint32_t avm_highbd_upsampled_pred_4tap_var_c(
+    const uint16_t *ref, int ref_stride, const uint16_t *second_pred,
+    const uint16_t *src, int src_stride, int width, int height, int subpel_x_q3,
+    int subpel_y_q3, int bd, uint32_t *sse) {
+  const InterpFilterParams *filter = av2_get_filter(USE_4_TAPS);
+  uint64_t sse_long = 0;
+  int64_t sum_long = 0;
+
+  if (!subpel_x_q3 && !subpel_y_q3) {
+    for (int y = 0; y < height; ++y) {
+      for (int x = 0; x < width; ++x) {
+        int pred = ref[y * ref_stride + x];
+        if (second_pred != NULL) {
+          pred = ROUND_POWER_OF_TWO(pred + second_pred[y * width + x], 1);
+        }
+        const int diff = pred - src[y * src_stride + x];
+        sum_long += diff;
+        sse_long += (uint32_t)(diff * diff);
+      }
+    }
+  } else if (!subpel_y_q3) {
+    const int16_t *const kx =
+        av2_get_interp_filter_subpel_kernel(filter, subpel_x_q3 << 1);
+    for (int y = 0; y < height; ++y) {
+      const uint16_t *r = ref + y * ref_stride;
+      for (int x = 0; x < width; ++x) {
+        const int conv = r[x - 1] * kx[2] + r[x] * kx[3] + r[x + 1] * kx[4] +
+                         r[x + 2] * kx[5];
+        int pred = clip_pixel_highbd(ROUND_POWER_OF_TWO(conv, FILTER_BITS), bd);
+        if (second_pred != NULL) {
+          pred = ROUND_POWER_OF_TWO(pred + second_pred[y * width + x], 1);
+        }
+        const int diff = pred - src[y * src_stride + x];
+        sum_long += diff;
+        sse_long += (uint32_t)(diff * diff);
+      }
+    }
+  } else if (!subpel_x_q3) {
+    const int16_t *const ky =
+        av2_get_interp_filter_subpel_kernel(filter, subpel_y_q3 << 1);
+    for (int y = 0; y < height; ++y) {
+      const uint16_t *r = ref + y * ref_stride;
+      for (int x = 0; x < width; ++x) {
+        const int conv = r[x - ref_stride] * ky[2] + r[x] * ky[3] +
+                         r[x + ref_stride] * ky[4] +
+                         r[x + 2 * ref_stride] * ky[5];
+        int pred = clip_pixel_highbd(ROUND_POWER_OF_TWO(conv, FILTER_BITS), bd);
+        if (second_pred != NULL) {
+          pred = ROUND_POWER_OF_TWO(pred + second_pred[y * width + x], 1);
+        }
+        const int diff = pred - src[y * src_stride + x];
+        sum_long += diff;
+        sse_long += (uint32_t)(diff * diff);
+      }
+    }
+  } else {
+    const int16_t *const kx =
+        av2_get_interp_filter_subpel_kernel(filter, subpel_x_q3 << 1);
+    const int16_t *const ky =
+        av2_get_interp_filter_subpel_kernel(filter, subpel_y_q3 << 1);
+    uint16_t horiz_rows[4][MAX_SB_SIZE];
+    for (int r_idx = 0; r_idx < 3; ++r_idx) {
+      const uint16_t *r = ref + (r_idx - 1) * ref_stride;
+      for (int x = 0; x < width; ++x) {
+        const int conv = r[x - 1] * kx[2] + r[x] * kx[3] + r[x + 1] * kx[4] +
+                         r[x + 2] * kx[5];
+        horiz_rows[r_idx][x] =
+            clip_pixel_highbd(ROUND_POWER_OF_TWO(conv, FILTER_BITS), bd);
+      }
+    }
+    for (int y = 0; y < height; ++y) {
+      const int next_slot = (y + 3) & 3;
+      const uint16_t *r = ref + (y + 2) * ref_stride;
+      for (int x = 0; x < width; ++x) {
+        const int conv = r[x - 1] * kx[2] + r[x] * kx[3] + r[x + 1] * kx[4] +
+                         r[x + 2] * kx[5];
+        horiz_rows[next_slot][x] =
+            clip_pixel_highbd(ROUND_POWER_OF_TWO(conv, FILTER_BITS), bd);
+      }
+      const uint16_t *h0 = horiz_rows[(y + 0) & 3];
+      const uint16_t *h1 = horiz_rows[(y + 1) & 3];
+      const uint16_t *h2 = horiz_rows[(y + 2) & 3];
+      const uint16_t *h3 = horiz_rows[next_slot];
+      for (int x = 0; x < width; ++x) {
+        const int conv =
+            h0[x] * ky[2] + h1[x] * ky[3] + h2[x] * ky[4] + h3[x] * ky[5];
+        int pred = clip_pixel_highbd(ROUND_POWER_OF_TWO(conv, FILTER_BITS), bd);
+        if (second_pred != NULL) {
+          pred = ROUND_POWER_OF_TWO(pred + second_pred[y * width + x], 1);
+        }
+        const int diff = pred - src[y * src_stride + x];
+        sum_long += diff;
+        sse_long += (uint32_t)(diff * diff);
+      }
+    }
+  }
+
+  int sum;
+  if (bd == 10) {
+    *sse = (uint32_t)ROUND_POWER_OF_TWO(sse_long, 4);
+    sum = (int)ROUND_POWER_OF_TWO(sum_long, 2);
+  } else if (bd == 12) {
+    *sse = (uint32_t)ROUND_POWER_OF_TWO(sse_long, 8);
+    sum = (int)ROUND_POWER_OF_TWO(sum_long, 4);
+  } else {
+    *sse = (uint32_t)sse_long;
+    sum = (int)sum_long;
+  }
+  const int64_t var =
+      (int64_t)(*sse) - (((int64_t)sum * sum) / (width * height));
+  return (var >= 0) ? (uint32_t)var : 0;
+}
+
 void avm_highbd_cwp_c(uint16_t *comp_pred, const uint16_t *pred, int width,
                       int height, const uint16_t *ref, int ref_stride,
                       const CWP_PARAMS *cwp_param) {

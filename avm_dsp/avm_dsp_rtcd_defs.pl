@@ -605,6 +605,9 @@ if (avm_config("CONFIG_AV2_ENCODER") eq "yes") {
 							  int bd, int subpel_search, int is_scaled_ref";
   specialize qw/avm_highbd_comp_avg_upsampled_pred sse2 avx2 neon/;
 
+  add_proto qw/uint32_t avm_highbd_upsampled_pred_4tap_var/, "const uint16_t *ref, int ref_stride, const uint16_t *second_pred, const uint16_t *src, int src_stride, int width, int height, int subpel_x_q3, int subpel_y_q3, int bd, uint32_t *sse";
+  specialize qw/avm_highbd_upsampled_pred_4tap_var avx2/;
+
   add_proto qw/void avm_highbd_cwp_upsampled/, "MACROBLOCKD *xd, const struct AV2Common *const cm, int mi_row, int mi_col,
                                                               const MV *const mv, uint16_t *comp_pred8, const uint16_t *pred8, int width,
                                                               int height, int subpel_x_q3, int subpel_y_q3, const uint16_t *ref8,

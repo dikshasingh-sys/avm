@@ -14,10 +14,12 @@
 #include <stdbool.h>
 #include <immintrin.h>  // AVX2
 
+#include "avm_ports/bitops.h"
 #include "avm_ports/mem.h"
 #include "config/avm_dsp_rtcd.h"
 #include "avm_dsp/avm_filter.h"
 #include "avm_dsp/x86/synonyms.h"
+#include "av2/common/filter.h"
 
 typedef void (*high_variance_fn_t)(const uint16_t *src, int src_stride,
                                    const uint16_t *ref, int ref_stride,
@@ -1712,3 +1714,505 @@ HIGHBD_BIL_SUBPIX_AVG_VAR_ALL_BD(16, 4, 6)
 #undef HIGHBD_BIL_BD12_VAR_AND_AVG
 #undef HIGHBD_BIL_SUBPIX_AVG_VAR_ALL_BD
 #undef HIGHBD_BIL_SUBPIX_VAR_FN
+
+static AVM_FORCE_INLINE void pack_4tap_coeffs_avx2(const int16_t *kernel,
+                                                   __m256i *coeffs) {
+  const __m256i v =
+      _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kernel));
+  coeffs[0] = _mm256_shuffle_epi32(v, 0x55);
+  coeffs[1] = _mm256_shuffle_epi32(v, 0xaa);
+}
+
+static AVM_FORCE_INLINE __m256i eval_4tap_avx2(const __m256i *tap_pairs,
+                                               const __m256i *coeffs,
+                                               __m256i round_const) {
+  const __m256i sum =
+      _mm256_add_epi32(_mm256_madd_epi16(tap_pairs[0], coeffs[0]),
+                       _mm256_madd_epi16(tap_pairs[1], coeffs[1]));
+  return _mm256_srai_epi32(_mm256_add_epi32(sum, round_const), FILTER_BITS);
+}
+
+static AVM_FORCE_INLINE __m256i horiz_4tap_row16_avx2(const uint16_t *row_ptr,
+                                                      const __m256i *fx,
+                                                      __m256i round_const,
+                                                      __m256i clip_pixel) {
+  const uint16_t *base = row_ptr - 1;
+  const __m256i s0 = _mm256_loadu_si256((const __m256i *)base);
+  const __m128i tail = _mm_loadl_epi64((const __m128i *)(base + 16));
+  const __m256i s1 =
+      _mm256_permute2x128_si256(s0, _mm256_castsi128_si256(tail), 0x21);
+  __m256i tap_even[2], tap_odd[2];
+  tap_even[0] = s0;
+  tap_even[1] = _mm256_alignr_epi8(s1, s0, 4);
+  tap_odd[0] = _mm256_alignr_epi8(s1, s0, 2);
+  tap_odd[1] = _mm256_alignr_epi8(s1, s0, 6);
+  const __m256i res_even = eval_4tap_avx2(tap_even, fx, round_const);
+  const __m256i res_odd = eval_4tap_avx2(tap_odd, fx, round_const);
+  const __m256i packed =
+      _mm256_unpacklo_epi16(_mm256_packus_epi32(res_even, res_even),
+                            _mm256_packus_epi32(res_odd, res_odd));
+  return _mm256_min_epi16(packed, clip_pixel);
+}
+
+static AVM_FORCE_INLINE __m256i horiz_4tap_2rows8_avx2(const uint16_t *row_a,
+                                                       const uint16_t *row_b,
+                                                       const __m256i *fx,
+                                                       __m256i round_const,
+                                                       __m256i clip_pixel) {
+  const __m128i a_lo = _mm_loadu_si128((const __m128i *)(row_a - 1));
+  const __m128i a_hi = _mm_loadl_epi64((const __m128i *)(row_a + 7));
+  const __m128i b_lo = _mm_loadu_si128((const __m128i *)(row_b - 1));
+  const __m128i b_hi = _mm_loadl_epi64((const __m128i *)(row_b + 7));
+  const __m256i r0 =
+      _mm256_inserti128_si256(_mm256_castsi128_si256(a_lo), b_lo, 1);
+  const __m256i r1 =
+      _mm256_inserti128_si256(_mm256_castsi128_si256(a_hi), b_hi, 1);
+  __m256i tap_even[2], tap_odd[2];
+  tap_even[0] = r0;
+  tap_even[1] = _mm256_alignr_epi8(r1, r0, 4);
+  tap_odd[0] = _mm256_alignr_epi8(r1, r0, 2);
+  tap_odd[1] = _mm256_alignr_epi8(r1, r0, 6);
+  const __m256i res_even = eval_4tap_avx2(tap_even, fx, round_const);
+  const __m256i res_odd = eval_4tap_avx2(tap_odd, fx, round_const);
+  const __m256i packed =
+      _mm256_unpacklo_epi16(_mm256_packus_epi32(res_even, res_even),
+                            _mm256_packus_epi32(res_odd, res_odd));
+  return _mm256_min_epi16(packed, clip_pixel);
+}
+
+static AVM_FORCE_INLINE __m256i horiz_4tap_2rows4_avx2(const uint16_t *row_a,
+                                                       const uint16_t *row_b,
+                                                       const __m256i *fx,
+                                                       __m256i round_const,
+                                                       __m256i clip_pixel) {
+  const __m128i a_lo = _mm_loadl_epi64((const __m128i *)(row_a - 1));
+  const __m128i a_hi = _mm_loadl_epi64((const __m128i *)(row_a + 2));
+  const __m128i b_lo = _mm_loadl_epi64((const __m128i *)(row_b - 1));
+  const __m128i b_hi = _mm_loadl_epi64((const __m128i *)(row_b + 2));
+  const __m128i a7 = _mm_unpacklo_epi64(a_lo, _mm_srli_si128(a_hi, 2));
+  const __m128i b7 = _mm_unpacklo_epi64(b_lo, _mm_srli_si128(b_hi, 2));
+  const __m256i rab =
+      _mm256_inserti128_si256(_mm256_castsi128_si256(a7), b7, 1);
+  __m256i tap_even[2], tap_odd[2];
+  tap_even[0] = rab;
+  tap_even[1] = _mm256_srli_si256(rab, 4);
+  tap_odd[0] = _mm256_srli_si256(rab, 2);
+  tap_odd[1] = _mm256_srli_si256(rab, 6);
+  const __m256i res_even = eval_4tap_avx2(tap_even, fx, round_const);
+  const __m256i res_odd = eval_4tap_avx2(tap_odd, fx, round_const);
+  const __m256i packed =
+      _mm256_unpacklo_epi16(_mm256_packus_epi32(res_even, res_even),
+                            _mm256_packus_epi32(res_odd, res_odd));
+  return _mm256_min_epi16(packed, clip_pixel);
+}
+
+static AVM_FORCE_INLINE __m256i pack_2x2rows4_avx2(__m256i ab, __m256i cd) {
+  return _mm256_permute4x64_epi64(_mm256_unpacklo_epi64(ab, cd), 0xd8);
+}
+
+static AVM_FORCE_INLINE __m256i vert_4tap_pack16_avx2(
+    __m256i p01_lo, __m256i p23_lo, __m256i p01_hi, __m256i p23_hi,
+    const __m256i *fy, __m256i round_const, __m256i clip_pixel) {
+  const __m256i tap_lo[2] = { p01_lo, p23_lo };
+  const __m256i tap_hi[2] = { p01_hi, p23_hi };
+  const __m256i res_lo = eval_4tap_avx2(tap_lo, fy, round_const);
+  const __m256i res_hi = eval_4tap_avx2(tap_hi, fy, round_const);
+  return _mm256_min_epi16(_mm256_packus_epi32(res_lo, res_hi), clip_pixel);
+}
+
+uint32_t avm_highbd_upsampled_pred_4tap_var_avx2(
+    const uint16_t *ref, int ref_stride, const uint16_t *second_pred,
+    const uint16_t *src, int src_stride, int width, int height, int subpel_x_q3,
+    int subpel_y_q3, int bd, uint32_t *sse) {
+  if (width < 4 || (width == 4 && (height & 3) != 0) ||
+      (width >= 8 && (height & 1) != 0)) {
+    return avm_highbd_upsampled_pred_4tap_var_c(
+        ref, ref_stride, second_pred, src, src_stride, width, height,
+        subpel_x_q3, subpel_y_q3, bd, sse);
+  }
+
+  const int shift = get_msb((unsigned int)(width * height));
+  uint64_t sse_long = 0;
+  int64_t sum_long = 0;
+
+  if (!subpel_x_q3 && !subpel_y_q3) {
+    highbd_bilinear_var_avx2(ref, ref_stride, 0, 0, src, src_stride,
+                             second_pred, width, height, second_pred != NULL,
+                             &sse_long, &sum_long);
+    return finalize_highbd_var_avx2(sse_long, sum_long, shift, bd, sse);
+  }
+
+  const InterpFilterParams *filter = av2_get_filter(USE_4_TAPS);
+  const __m256i round_const = _mm256_set1_epi32(1 << (FILTER_BITS - 1));
+  const __m256i clip_pixel = _mm256_set1_epi16((1 << bd) - 1);
+  __m256i fx[2] = { _mm256_setzero_si256(), _mm256_setzero_si256() };
+  __m256i fy[2] = { _mm256_setzero_si256(), _mm256_setzero_si256() };
+  if (subpel_x_q3) {
+    pack_4tap_coeffs_avx2(
+        av2_get_interp_filter_subpel_kernel(filter, subpel_x_q3 << 1), fx);
+  }
+  if (subpel_y_q3) {
+    pack_4tap_coeffs_avx2(
+        av2_get_interp_filter_subpel_kernel(filter, subpel_y_q3 << 1), fy);
+  }
+
+  if (width == 4) {
+    __m256i sum_vec = _mm256_setzero_si256();
+    __m256i sse_vec = _mm256_setzero_si256();
+    int vec_count = 0;
+    if (!subpel_y_q3) {
+      for (int y = 0; y < height; y += 4) {
+        const __m256i ab = horiz_4tap_2rows4_avx2(ref + y * ref_stride,
+                                                  ref + (y + 1) * ref_stride,
+                                                  fx, round_const, clip_pixel);
+        const __m256i cd = horiz_4tap_2rows4_avx2(ref + (y + 2) * ref_stride,
+                                                  ref + (y + 3) * ref_stride,
+                                                  fx, round_const, clip_pixel);
+        __m256i pred = pack_2x2rows4_avx2(ab, cd);
+        if (second_pred != NULL) {
+          pred = _mm256_avg_epu16(
+              pred, _mm256_loadu_si256((const __m256i *)(second_pred + y * 4)));
+        }
+        const __m256i src_v = load_4rows4_avx2(
+            src + y * src_stride, src + (y + 1) * src_stride,
+            src + (y + 2) * src_stride, src + (y + 3) * src_stride);
+        accum_var_diff16_avx2(pred, src_v, &sum_vec, &sse_vec);
+        if (++vec_count == 8) {
+          flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+          vec_count = 0;
+        }
+      }
+    } else {
+      __m128i h_m1, h_0, h_1;
+      if (!subpel_x_q3) {
+        h_m1 = _mm_loadl_epi64((const __m128i *)(ref - ref_stride));
+        h_0 = _mm_loadl_epi64((const __m128i *)ref);
+        h_1 = _mm_loadl_epi64((const __m128i *)(ref + ref_stride));
+      } else {
+        const __m256i hr_m1_0 = horiz_4tap_2rows4_avx2(
+            ref - ref_stride, ref, fx, round_const, clip_pixel);
+        h_m1 = _mm256_castsi256_si128(hr_m1_0);
+        h_0 = _mm256_extracti128_si256(hr_m1_0, 1);
+        h_1 = _mm256_castsi256_si128(horiz_4tap_2rows4_avx2(
+            ref + ref_stride, ref + ref_stride, fx, round_const, clip_pixel));
+      }
+      for (int y = 0; y < height; y += 4) {
+        __m128i h_2, h_3, h_4, h_5;
+        if (!subpel_x_q3) {
+          h_2 = _mm_loadl_epi64((const __m128i *)(ref + (y + 2) * ref_stride));
+          h_3 = _mm_loadl_epi64((const __m128i *)(ref + (y + 3) * ref_stride));
+          h_4 = _mm_loadl_epi64((const __m128i *)(ref + (y + 4) * ref_stride));
+          h_5 = _mm_loadl_epi64((const __m128i *)(ref + (y + 5) * ref_stride));
+        } else {
+          const __m256i hr_2_3 = horiz_4tap_2rows4_avx2(
+              ref + (y + 2) * ref_stride, ref + (y + 3) * ref_stride, fx,
+              round_const, clip_pixel);
+          const __m256i hr_4_5 = horiz_4tap_2rows4_avx2(
+              ref + (y + 4) * ref_stride, ref + (y + 5) * ref_stride, fx,
+              round_const, clip_pixel);
+          h_2 = _mm256_castsi256_si128(hr_2_3);
+          h_3 = _mm256_extracti128_si256(hr_2_3, 1);
+          h_4 = _mm256_castsi256_si128(hr_4_5);
+          h_5 = _mm256_extracti128_si256(hr_4_5, 1);
+        }
+        const __m128i pair_m1_0 = _mm_unpacklo_epi64(h_m1, h_0);
+        const __m128i pair_0_1 = _mm_unpacklo_epi64(h_0, h_1);
+        const __m128i pair_1_2 = _mm_unpacklo_epi64(h_1, h_2);
+        const __m128i pair_2_3 = _mm_unpacklo_epi64(h_2, h_3);
+        const __m128i pair_3_4 = _mm_unpacklo_epi64(h_3, h_4);
+        const __m128i pair_4_5 = _mm_unpacklo_epi64(h_4, h_5);
+        const __m256i v_m1 = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(pair_m1_0), pair_1_2, 1);
+        const __m256i v_0 = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(pair_0_1), pair_2_3, 1);
+        const __m256i v_1 = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(pair_1_2), pair_3_4, 1);
+        const __m256i v_2 = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(pair_2_3), pair_4_5, 1);
+        __m256i pred = vert_4tap_pack16_avx2(
+            _mm256_unpacklo_epi16(v_m1, v_0), _mm256_unpacklo_epi16(v_1, v_2),
+            _mm256_unpackhi_epi16(v_m1, v_0), _mm256_unpackhi_epi16(v_1, v_2),
+            fy, round_const, clip_pixel);
+        h_m1 = h_3;
+        h_0 = h_4;
+        h_1 = h_5;
+        if (second_pred != NULL) {
+          pred = _mm256_avg_epu16(
+              pred, _mm256_loadu_si256((const __m256i *)(second_pred + y * 4)));
+        }
+        const __m256i src_v = load_4rows4_avx2(
+            src + y * src_stride, src + (y + 1) * src_stride,
+            src + (y + 2) * src_stride, src + (y + 3) * src_stride);
+        accum_var_diff16_avx2(pred, src_v, &sum_vec, &sse_vec);
+        if (++vec_count == 8) {
+          flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+          vec_count = 0;
+        }
+      }
+    }
+    if (vec_count > 0) {
+      flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+    }
+    return finalize_highbd_var_avx2(sse_long, sum_long, shift, bd, sse);
+  }
+
+  if (width == 8) {
+    __m256i sum_vec = _mm256_setzero_si256();
+    __m256i sse_vec = _mm256_setzero_si256();
+    int vec_count = 0;
+    if (!subpel_y_q3) {
+      for (int y = 0; y < height; y += 2) {
+        __m256i pred = horiz_4tap_2rows8_avx2(ref + y * ref_stride,
+                                              ref + (y + 1) * ref_stride, fx,
+                                              round_const, clip_pixel);
+        if (second_pred != NULL) {
+          pred = _mm256_avg_epu16(
+              pred, _mm256_loadu_si256((const __m256i *)(second_pred + y * 8)));
+        }
+        const __m256i src_v =
+            load_2rows8_avx2(src + y * src_stride, src + (y + 1) * src_stride);
+        accum_var_diff16_avx2(pred, src_v, &sum_vec, &sse_vec);
+        if (++vec_count == 8) {
+          flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+          vec_count = 0;
+        }
+      }
+    } else if (!subpel_x_q3) {
+      const __m128i r_m1 = _mm_loadu_si128((const __m128i *)(ref - ref_stride));
+      const __m128i r0 = _mm_loadu_si128((const __m128i *)ref);
+      __m128i prev_r1 = _mm_loadu_si128((const __m128i *)(ref + ref_stride));
+      const __m256i s01 =
+          _mm256_inserti128_si256(_mm256_castsi128_si256(r_m1), r0, 1);
+      const __m256i s12 =
+          _mm256_inserti128_si256(_mm256_castsi128_si256(r0), prev_r1, 1);
+      __m256i pair01_lo = _mm256_unpacklo_epi16(s01, s12);
+      __m256i pair01_hi = _mm256_unpackhi_epi16(s01, s12);
+
+      for (int y = 0; y < height; y += 2) {
+        const __m128i r2 =
+            _mm_loadu_si128((const __m128i *)(ref + (y + 2) * ref_stride));
+        const __m128i r3 =
+            _mm_loadu_si128((const __m128i *)(ref + (y + 3) * ref_stride));
+        const __m256i s23 =
+            _mm256_inserti128_si256(_mm256_castsi128_si256(prev_r1), r2, 1);
+        const __m256i s34 =
+            _mm256_inserti128_si256(_mm256_castsi128_si256(r2), r3, 1);
+        const __m256i pair23_lo = _mm256_unpacklo_epi16(s23, s34);
+        const __m256i pair23_hi = _mm256_unpackhi_epi16(s23, s34);
+        __m256i pred =
+            vert_4tap_pack16_avx2(pair01_lo, pair23_lo, pair01_hi, pair23_hi,
+                                  fy, round_const, clip_pixel);
+        pair01_lo = pair23_lo;
+        pair01_hi = pair23_hi;
+        prev_r1 = r3;
+        if (second_pred != NULL) {
+          pred = _mm256_avg_epu16(
+              pred, _mm256_loadu_si256((const __m256i *)(second_pred + y * 8)));
+        }
+        const __m256i src_v =
+            load_2rows8_avx2(src + y * src_stride, src + (y + 1) * src_stride);
+        accum_var_diff16_avx2(pred, src_v, &sum_vec, &sse_vec);
+        if (++vec_count == 8) {
+          flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+          vec_count = 0;
+        }
+      }
+    } else {
+      const __m256i hr_m1_0 = horiz_4tap_2rows8_avx2(ref - ref_stride, ref, fx,
+                                                     round_const, clip_pixel);
+      __m128i prev_h1 = _mm256_castsi256_si128(horiz_4tap_2rows8_avx2(
+          ref + ref_stride, ref + ref_stride, fx, round_const, clip_pixel));
+      const __m256i s12 = _mm256_inserti128_si256(
+          _mm256_castsi128_si256(_mm256_extracti128_si256(hr_m1_0, 1)), prev_h1,
+          1);
+      __m256i pair01_lo = _mm256_unpacklo_epi16(hr_m1_0, s12);
+      __m256i pair01_hi = _mm256_unpackhi_epi16(hr_m1_0, s12);
+
+      for (int y = 0; y < height; y += 2) {
+        const __m256i hr_2_3 = horiz_4tap_2rows8_avx2(
+            ref + (y + 2) * ref_stride, ref + (y + 3) * ref_stride, fx,
+            round_const, clip_pixel);
+        const __m256i s23 = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(prev_h1), _mm256_castsi256_si128(hr_2_3), 1);
+        const __m256i pair23_lo = _mm256_unpacklo_epi16(s23, hr_2_3);
+        const __m256i pair23_hi = _mm256_unpackhi_epi16(s23, hr_2_3);
+        __m256i pred =
+            vert_4tap_pack16_avx2(pair01_lo, pair23_lo, pair01_hi, pair23_hi,
+                                  fy, round_const, clip_pixel);
+        pair01_lo = pair23_lo;
+        pair01_hi = pair23_hi;
+        prev_h1 = _mm256_extracti128_si256(hr_2_3, 1);
+        if (second_pred != NULL) {
+          pred = _mm256_avg_epu16(
+              pred, _mm256_loadu_si256((const __m256i *)(second_pred + y * 8)));
+        }
+        const __m256i src_v =
+            load_2rows8_avx2(src + y * src_stride, src + (y + 1) * src_stride);
+        accum_var_diff16_avx2(pred, src_v, &sum_vec, &sse_vec);
+        if (++vec_count == 8) {
+          flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+          vec_count = 0;
+        }
+      }
+    }
+    if (vec_count > 0) {
+      flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+    }
+    return finalize_highbd_var_avx2(sse_long, sum_long, shift, bd, sse);
+  }
+
+  for (int col = 0; col < width; col += 16) {
+    __m256i sum_vec = _mm256_setzero_si256();
+    __m256i sse_vec = _mm256_setzero_si256();
+    int vec_count = 0;
+    const uint16_t *ref_col = ref + col;
+    const uint16_t *src_col = src + col;
+
+    if (!subpel_y_q3) {
+      for (int y = 0; y < height; y += 2) {
+        __m256i pred0 = horiz_4tap_row16_avx2(ref_col + y * ref_stride, fx,
+                                              round_const, clip_pixel);
+        __m256i pred1 = horiz_4tap_row16_avx2(ref_col + (y + 1) * ref_stride,
+                                              fx, round_const, clip_pixel);
+        if (second_pred != NULL) {
+          pred0 = _mm256_avg_epu16(
+              pred0, _mm256_loadu_si256(
+                         (const __m256i *)(second_pred + y * width + col)));
+          pred1 = _mm256_avg_epu16(
+              pred1,
+              _mm256_loadu_si256(
+                  (const __m256i *)(second_pred + (y + 1) * width + col)));
+        }
+        accum_var_diff16_avx2(
+            pred0,
+            _mm256_loadu_si256((const __m256i *)(src_col + y * src_stride)),
+            &sum_vec, &sse_vec);
+        accum_var_diff16_avx2(
+            pred1,
+            _mm256_loadu_si256(
+                (const __m256i *)(src_col + (y + 1) * src_stride)),
+            &sum_vec, &sse_vec);
+        vec_count += 2;
+        if (vec_count == 8) {
+          flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+          vec_count = 0;
+        }
+      }
+    } else if (!subpel_x_q3) {
+      const __m256i r_m1 =
+          _mm256_loadu_si256((const __m256i *)(ref_col - ref_stride));
+      const __m256i r0 = _mm256_loadu_si256((const __m256i *)ref_col);
+      __m256i r1 = _mm256_loadu_si256((const __m256i *)(ref_col + ref_stride));
+      __m256i p01_lo = _mm256_unpacklo_epi16(r_m1, r0);
+      __m256i p01_hi = _mm256_unpackhi_epi16(r_m1, r0);
+      __m256i p12_lo = _mm256_unpacklo_epi16(r0, r1);
+      __m256i p12_hi = _mm256_unpackhi_epi16(r0, r1);
+
+      for (int y = 0; y < height; y += 2) {
+        const __m256i r2 = _mm256_loadu_si256(
+            (const __m256i *)(ref_col + (y + 2) * ref_stride));
+        const __m256i r3 = _mm256_loadu_si256(
+            (const __m256i *)(ref_col + (y + 3) * ref_stride));
+        const __m256i p23_lo = _mm256_unpacklo_epi16(r1, r2);
+        const __m256i p23_hi = _mm256_unpackhi_epi16(r1, r2);
+        const __m256i p34_lo = _mm256_unpacklo_epi16(r2, r3);
+        const __m256i p34_hi = _mm256_unpackhi_epi16(r2, r3);
+
+        __m256i pred0 = vert_4tap_pack16_avx2(p01_lo, p23_lo, p01_hi, p23_hi,
+                                              fy, round_const, clip_pixel);
+        __m256i pred1 = vert_4tap_pack16_avx2(p12_lo, p34_lo, p12_hi, p34_hi,
+                                              fy, round_const, clip_pixel);
+        p01_lo = p23_lo;
+        p01_hi = p23_hi;
+        p12_lo = p34_lo;
+        p12_hi = p34_hi;
+        r1 = r3;
+
+        if (second_pred != NULL) {
+          pred0 = _mm256_avg_epu16(
+              pred0, _mm256_loadu_si256(
+                         (const __m256i *)(second_pred + y * width + col)));
+          pred1 = _mm256_avg_epu16(
+              pred1,
+              _mm256_loadu_si256(
+                  (const __m256i *)(second_pred + (y + 1) * width + col)));
+        }
+        accum_var_diff16_avx2(
+            pred0,
+            _mm256_loadu_si256((const __m256i *)(src_col + y * src_stride)),
+            &sum_vec, &sse_vec);
+        accum_var_diff16_avx2(
+            pred1,
+            _mm256_loadu_si256(
+                (const __m256i *)(src_col + (y + 1) * src_stride)),
+            &sum_vec, &sse_vec);
+        vec_count += 2;
+        if (vec_count == 8) {
+          flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+          vec_count = 0;
+        }
+      }
+    } else {
+      const __m256i hr_m1 = horiz_4tap_row16_avx2(ref_col - ref_stride, fx,
+                                                  round_const, clip_pixel);
+      const __m256i hr0 =
+          horiz_4tap_row16_avx2(ref_col, fx, round_const, clip_pixel);
+      __m256i hr1 = horiz_4tap_row16_avx2(ref_col + ref_stride, fx, round_const,
+                                          clip_pixel);
+      __m256i p01_lo = _mm256_unpacklo_epi16(hr_m1, hr0);
+      __m256i p01_hi = _mm256_unpackhi_epi16(hr_m1, hr0);
+      __m256i p12_lo = _mm256_unpacklo_epi16(hr0, hr1);
+      __m256i p12_hi = _mm256_unpackhi_epi16(hr0, hr1);
+
+      for (int y = 0; y < height; y += 2) {
+        const __m256i hr2 = horiz_4tap_row16_avx2(
+            ref_col + (y + 2) * ref_stride, fx, round_const, clip_pixel);
+        const __m256i hr3 = horiz_4tap_row16_avx2(
+            ref_col + (y + 3) * ref_stride, fx, round_const, clip_pixel);
+        const __m256i p23_lo = _mm256_unpacklo_epi16(hr1, hr2);
+        const __m256i p23_hi = _mm256_unpackhi_epi16(hr1, hr2);
+        const __m256i p34_lo = _mm256_unpacklo_epi16(hr2, hr3);
+        const __m256i p34_hi = _mm256_unpackhi_epi16(hr2, hr3);
+
+        __m256i pred0 = vert_4tap_pack16_avx2(p01_lo, p23_lo, p01_hi, p23_hi,
+                                              fy, round_const, clip_pixel);
+        __m256i pred1 = vert_4tap_pack16_avx2(p12_lo, p34_lo, p12_hi, p34_hi,
+                                              fy, round_const, clip_pixel);
+        p01_lo = p23_lo;
+        p01_hi = p23_hi;
+        p12_lo = p34_lo;
+        p12_hi = p34_hi;
+        hr1 = hr3;
+
+        if (second_pred != NULL) {
+          pred0 = _mm256_avg_epu16(
+              pred0, _mm256_loadu_si256(
+                         (const __m256i *)(second_pred + y * width + col)));
+          pred1 = _mm256_avg_epu16(
+              pred1,
+              _mm256_loadu_si256(
+                  (const __m256i *)(second_pred + (y + 1) * width + col)));
+        }
+        accum_var_diff16_avx2(
+            pred0,
+            _mm256_loadu_si256((const __m256i *)(src_col + y * src_stride)),
+            &sum_vec, &sse_vec);
+        accum_var_diff16_avx2(
+            pred1,
+            _mm256_loadu_si256(
+                (const __m256i *)(src_col + (y + 1) * src_stride)),
+            &sum_vec, &sse_vec);
+        vec_count += 2;
+        if (vec_count == 8) {
+          flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+          vec_count = 0;
+        }
+      }
+    }
+    if (vec_count > 0) {
+      flush_var_accum_avx2(&sum_vec, &sse_vec, &sum_long, &sse_long);
+    }
+  }
+
+  return finalize_highbd_var_avx2(sse_long, sum_long, shift, bd, sse);
+}
