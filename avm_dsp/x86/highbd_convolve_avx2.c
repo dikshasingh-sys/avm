@@ -773,99 +773,89 @@ static void avm_highbd_filter_block1d8_h4_avx2(
     const uint16_t *src_ptr, ptrdiff_t src_pitch, uint16_t *dst_ptr,
     ptrdiff_t dst_pitch, uint32_t height, const int16_t *filter, int bd) {
   const __m256i rounding = _mm256_set1_epi32(1 << (CONV8_ROUNDING_BITS - 1));
+  const __m256i clip_pixel = _mm256_set1_epi16((1 << bd) - 1);
   __m256i ff[2], s[2];
   uint32_t i = 0;
-  const __m256i clip_pixel =
-      _mm256_set1_epi16(bd == 10 ? 1023 : (bd == 12 ? 4095 : 255));
-  const __m256i zero = _mm256_setzero_si256();
-
-  static const uint8_t shuffle_mask[32] = { 0, 1, 8,  9,  2, 3, 10, 11,
-                                            4, 5, 12, 13, 6, 7, 14, 15,
-                                            0, 1, 8,  9,  2, 3, 10, 11,
-                                            4, 5, 12, 13, 6, 7, 14, 15 };
-
-  __m256i mask = _mm256_loadu_si256((__m256i *)shuffle_mask);
-  __m256i ip_mask_f2f3 = _mm256_loadu_si256((__m256i *)ip_shuffle_f2f3);
-  __m256i ip_mask_f4f5 = _mm256_loadu_si256((__m256i *)ip_shuffle_f4f5);
 
   pack_filters_4tap(filter, ff);
-  src_ptr -= 3;
+  const uint16_t *row_src = src_ptr - 1;
 
-  /* Horizontal filter */
-
-  for (i = 0; i <= (height - 2); i += 2) {
+  for (i = 0; i + 2 <= height; i += 2) {
     const __m256i row0 =
-        _mm256_loadu_si256((__m256i *)&src_ptr[i * src_pitch + 2]);
-    __m256i row1 =
-        _mm256_loadu_si256((__m256i *)&src_ptr[(i + 1) * src_pitch + 2]);
+        _mm256_loadu_si256((const __m256i *)&row_src[i * src_pitch]);
+    const __m256i row1 =
+        _mm256_loadu_si256((const __m256i *)&row_src[(i + 1) * src_pitch]);
 
     const __m256i r0 =
         _mm256_inserti128_si256(row0, _mm256_castsi256_si128(row1), 1);
     const __m256i r1 = _mm256_permute2x128_si256(row0, row1, 0x31);
 
-    // even pixels
     s[0] = r0;
     s[1] = _mm256_alignr_epi8(r1, r0, 4);
+    const __m256i res_even = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(s, ff), rounding), CONV8_ROUNDING_BITS);
 
-    __m256i res_even = convolve_4tap(s, ff);
-    res_even = _mm256_srai_epi32(_mm256_add_epi32(res_even, rounding),
-                                 CONV8_ROUNDING_BITS);
-
-    // odd pixels
     s[0] = _mm256_alignr_epi8(r1, r0, 2);
     s[1] = _mm256_alignr_epi8(r1, r0, 6);
+    const __m256i res_odd = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(s, ff), rounding), CONV8_ROUNDING_BITS);
 
-    __m256i res_odd = convolve_4tap(s, ff);
-    res_odd = _mm256_srai_epi32(_mm256_add_epi32(res_odd, rounding),
-                                CONV8_ROUNDING_BITS);
-
-    __m256i res = _mm256_packs_epi32(res_even, res_odd);
-    res = _mm256_shuffle_epi8(res, mask);
-
-    res = _mm256_min_epi16(res, clip_pixel);
-    res = _mm256_max_epi16(res, zero);
-
-    _mm_storeu_si128((__m128i *)&dst_ptr[i * dst_pitch],
-                     _mm256_castsi256_si128(res));
-    _mm_storeu_si128((__m128i *)&dst_ptr[i * dst_pitch + dst_pitch],
-                     _mm256_extracti128_si256(res, 1));
+    unpack_and_store_8x2_pixels_6t(&res_even, &res_odd, &clip_pixel,
+                                   &dst_ptr[i * dst_pitch], dst_pitch);
   }
 
-  if (height % 2 != 0) {
-    i = height - 1;
+  if (height & 1) {
+    const __m256i ip_mask_f2f3 =
+        _mm256_loadu_si256((const __m256i *)ip_shuffle_f2f3);
+    const __m256i ip_mask_f4f5 =
+        _mm256_loadu_si256((const __m256i *)ip_shuffle_f4f5);
     const __m256i row0_0 =
-        _mm256_loadu_si256((__m256i *)&src_ptr[i * src_pitch + 2]);
+        _mm256_loadu_si256((const __m256i *)&row_src[i * src_pitch]);
     const __m256i row0_1 =
-        _mm256_loadu_si256((__m256i *)&src_ptr[i * src_pitch + 6]);
-
+        _mm256_loadu_si256((const __m256i *)&row_src[i * src_pitch + 4]);
     const __m256i r0 =
         _mm256_inserti128_si256(row0_0, _mm256_castsi256_si128(row0_1), 1);
 
     s[0] = _mm256_shuffle_epi8(r0, ip_mask_f2f3);
     s[1] = _mm256_shuffle_epi8(r0, ip_mask_f4f5);
-
-    __m256i res = convolve_4tap(s, ff);
-    res =
-        _mm256_srai_epi32(_mm256_add_epi32(res, rounding), CONV8_ROUNDING_BITS);
-
-    res = _mm256_packs_epi32(res, res);
-    res = _mm256_min_epi16(res, clip_pixel);
-    res = _mm256_max_epi16(res, zero);
-
-    _mm_storel_epi64((__m128i *)&dst_ptr[i * dst_pitch],
-                     _mm256_castsi256_si128(res));
-    _mm_storel_epi64((__m128i *)&dst_ptr[i * dst_pitch + 4],
-                     _mm256_extracti128_si256(res, 1));
+    const __m256i res = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(s, ff), rounding), CONV8_ROUNDING_BITS);
+    store_8x1_pixels(&res, &clip_pixel, &dst_ptr[i * dst_pitch]);
   }
 }
 
 static void avm_highbd_filter_block1d16_h4_avx2(
     const uint16_t *src_ptr, ptrdiff_t src_pitch, uint16_t *dst_ptr,
     ptrdiff_t dst_pitch, uint32_t height, const int16_t *filter, int bd) {
-  avm_highbd_filter_block1d8_h4_avx2(src_ptr, src_pitch, dst_ptr, dst_pitch,
-                                     height, filter, bd);
-  avm_highbd_filter_block1d8_h4_avx2(src_ptr + 8, src_pitch, dst_ptr + 8,
-                                     dst_pitch, height, filter, bd);
+  const __m256i rounding = _mm256_set1_epi32(1 << (CONV8_ROUNDING_BITS - 1));
+  const __m256i clip_pixel = _mm256_set1_epi16((1 << bd) - 1);
+  __m256i filter_coeffs[2], tap_pairs[2];
+  pack_filters_4tap(filter, filter_coeffs);
+
+  const uint16_t *row_src = src_ptr - 1;
+  do {
+    const __m256i s0 = _mm256_loadu_si256((const __m256i *)row_src);
+    const __m128i tail = _mm_loadl_epi64((const __m128i *)(row_src + 16));
+    const __m256i s1 =
+        _mm256_permute2x128_si256(s0, _mm256_castsi128_si256(tail), 0x21);
+
+    tap_pairs[0] = s0;
+    tap_pairs[1] = _mm256_alignr_epi8(s1, s0, 4);
+    const __m256i res_even = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(tap_pairs, filter_coeffs), rounding),
+        CONV8_ROUNDING_BITS);
+
+    tap_pairs[0] = _mm256_alignr_epi8(s1, s0, 2);
+    tap_pairs[1] = _mm256_alignr_epi8(s1, s0, 6);
+    const __m256i res_odd = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(tap_pairs, filter_coeffs), rounding),
+        CONV8_ROUNDING_BITS);
+
+    unpack_and_store_16x1_pixels(res_even, res_odd, clip_pixel, dst_ptr);
+    row_src += src_pitch;
+    dst_ptr += dst_pitch;
+    height -= 1;
+  } while (height > 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -1446,77 +1436,148 @@ static void avm_highbd_filter_block1d4_v4_avx2(
 static void avm_highbd_filter_block1d8_v4_avx2(
     const uint16_t *src_ptr, ptrdiff_t src_pitch, uint16_t *dst_ptr,
     ptrdiff_t dst_pitch, uint32_t height, const int16_t *filter, int bd) {
-  const int bits = FILTER_BITS;
-
-  const __m128i round_shift_bits = _mm_cvtsi32_si128(bits);
-  const __m256i round_const_bits = _mm256_set1_epi32((1 << bits) >> 1);
-  const __m256i clip_pixel =
-      _mm256_set1_epi16(bd == 10 ? 1023 : (bd == 12 ? 4095 : 255));
-  const __m256i zero = _mm256_setzero_si256();
+  const __m256i round_const = _mm256_set1_epi32((1 << FILTER_BITS) >> 1);
+  const __m256i clip_pixel = _mm256_set1_epi16((1 << bd) - 1);
   __m256i s[4], ff[2];
-  uint32_t i;
+  uint32_t i = 0;
   pack_filters_4tap(filter, ff);
 
-  const uint16_t *data = src_ptr;
-  /* Vertical filter */
-  {
-    __m128i s2 = _mm_loadu_si128((__m128i *)(data + 2 * src_pitch));
-    __m128i s3 = _mm_loadu_si128((__m128i *)(data + 3 * src_pitch));
+  const __m128i s2 =
+      _mm_loadu_si128((const __m128i *)(src_ptr + 2 * src_pitch));
+  const __m128i s3 =
+      _mm_loadu_si128((const __m128i *)(src_ptr + 3 * src_pitch));
+  __m128i s4 = _mm_loadu_si128((const __m128i *)(src_ptr + 4 * src_pitch));
 
-    __m256i s23 = _mm256_inserti128_si256(_mm256_castsi128_si256(s2), s3, 1);
+  const __m256i s23 =
+      _mm256_inserti128_si256(_mm256_castsi128_si256(s2), s3, 1);
+  const __m256i s34 =
+      _mm256_inserti128_si256(_mm256_castsi128_si256(s3), s4, 1);
 
-    __m128i s4 = _mm_loadu_si128((__m128i *)(data + 4 * src_pitch));
+  s[0] = _mm256_unpacklo_epi16(s23, s34);
+  s[2] = _mm256_unpackhi_epi16(s23, s34);
 
-    __m256i s34 = _mm256_inserti128_si256(_mm256_castsi128_si256(s3), s4, 1);
+  for (; i + 2 <= height; i += 2) {
+    const uint16_t *data = &src_ptr[i * src_pitch];
+    const __m128i s5 = _mm_loadu_si128((const __m128i *)(data + 5 * src_pitch));
+    const __m128i s6 = _mm_loadu_si128((const __m128i *)(data + 6 * src_pitch));
 
-    s[0] = _mm256_unpacklo_epi16(s23, s34);
-    s[2] = _mm256_unpackhi_epi16(s23, s34);
+    const __m256i s45 =
+        _mm256_inserti128_si256(_mm256_castsi128_si256(s4), s5, 1);
+    const __m256i s56 =
+        _mm256_inserti128_si256(_mm256_castsi128_si256(s5), s6, 1);
 
-    for (i = 0; i < height; i += 2) {
-      data = &src_ptr[i * src_pitch];
+    s[1] = _mm256_unpacklo_epi16(s45, s56);
+    s[3] = _mm256_unpackhi_epi16(s45, s56);
 
-      __m128i s5 = _mm_loadu_si128((__m128i *)(data + 5 * src_pitch));
-      __m128i s6 = _mm_loadu_si128((__m128i *)(data + 6 * src_pitch));
+    const __m256i res_a_round = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(s, ff), round_const), FILTER_BITS);
+    const __m256i res_b_round = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(s + 2, ff), round_const), FILTER_BITS);
 
-      __m256i s45 = _mm256_inserti128_si256(_mm256_castsi128_si256(s4), s5, 1);
-      __m256i s56 = _mm256_inserti128_si256(_mm256_castsi128_si256(s5), s6, 1);
+    store_8x2_pixels(&res_a_round, &res_b_round, &clip_pixel,
+                     &dst_ptr[i * dst_pitch], dst_pitch);
 
-      s[1] = _mm256_unpacklo_epi16(s45, s56);
-      s[3] = _mm256_unpackhi_epi16(s45, s56);
+    s[0] = s[1];
+    s[2] = s[3];
+    s4 = s6;
+  }
 
-      const __m256i res_a = convolve_4tap(s, ff);
-
-      __m256i res_a_round = _mm256_sra_epi32(
-          _mm256_add_epi32(res_a, round_const_bits), round_shift_bits);
-
-      const __m256i res_b = convolve_4tap(s + 2, ff);
-      __m256i res_b_round = _mm256_sra_epi32(
-          _mm256_add_epi32(res_b, round_const_bits), round_shift_bits);
-
-      __m256i res_16bit = _mm256_packs_epi32(res_a_round, res_b_round);
-      res_16bit = _mm256_min_epi16(res_16bit, clip_pixel);
-      res_16bit = _mm256_max_epi16(res_16bit, zero);
-
-      _mm_storeu_si128((__m128i *)&dst_ptr[i * dst_pitch],
-                       _mm256_castsi256_si128(res_16bit));
-      _mm_storeu_si128((__m128i *)&dst_ptr[i * dst_pitch + dst_pitch],
-                       _mm256_extracti128_si256(res_16bit, 1));
-
-      s[0] = s[1];
-      s[2] = s[3];
-      s4 = s6;
-    }
+  if (i < height) {
+    const __m128i s5 =
+        _mm_loadu_si128((const __m128i *)(src_ptr + (i + 5) * src_pitch));
+    const __m256i s4_256 = _mm256_castsi128_si256(s4);
+    const __m256i s5_256 = _mm256_castsi128_si256(s5);
+    s[1] = _mm256_unpacklo_epi16(s4_256, s5_256);
+    s[3] = _mm256_unpackhi_epi16(s4_256, s5_256);
+    const __m128i res_lo = _mm256_castsi256_si128(_mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(s, ff), round_const), FILTER_BITS));
+    const __m128i res_hi = _mm256_castsi256_si128(_mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(s + 2, ff), round_const), FILTER_BITS));
+    __m128i res_16 = _mm_packus_epi32(res_lo, res_hi);
+    res_16 = _mm_min_epi16(res_16, _mm256_castsi256_si128(clip_pixel));
+    _mm_storeu_si128((__m128i *)&dst_ptr[i * dst_pitch], res_16);
   }
 }
 
 static void avm_highbd_filter_block1d16_v4_avx2(
     const uint16_t *src_ptr, ptrdiff_t src_pitch, uint16_t *dst_ptr,
     ptrdiff_t dst_pitch, uint32_t height, const int16_t *filter, int bd) {
-  avm_highbd_filter_block1d8_v4_avx2(src_ptr, src_pitch, dst_ptr, dst_pitch,
-                                     height, filter, bd);
+  const __m256i round_const = _mm256_set1_epi32((1 << FILTER_BITS) >> 1);
+  const __m256i clip_pixel = _mm256_set1_epi16((1 << bd) - 1);
+  __m256i filter_coeffs[2], tap_lo[2], tap_hi[2];
+  pack_filters_4tap(filter, filter_coeffs);
 
-  avm_highbd_filter_block1d8_v4_avx2(src_ptr + 8, src_pitch, dst_ptr + 8,
-                                     dst_pitch, height, filter, bd);
+  const __m256i row2 =
+      _mm256_loadu_si256((const __m256i *)(src_ptr + 2 * src_pitch));
+  const __m256i row3 =
+      _mm256_loadu_si256((const __m256i *)(src_ptr + 3 * src_pitch));
+  __m256i row4 = _mm256_loadu_si256((const __m256i *)(src_ptr + 4 * src_pitch));
+
+  __m256i pair23_lo = _mm256_unpacklo_epi16(row2, row3);
+  __m256i pair23_hi = _mm256_unpackhi_epi16(row2, row3);
+  __m256i pair34_lo = _mm256_unpacklo_epi16(row3, row4);
+  __m256i pair34_hi = _mm256_unpackhi_epi16(row3, row4);
+
+  uint32_t y = 0;
+  for (; y + 2 <= height; y += 2) {
+    const uint16_t *row_base = src_ptr + y * src_pitch;
+    const __m256i row5 =
+        _mm256_loadu_si256((const __m256i *)(row_base + 5 * src_pitch));
+    const __m256i row6 =
+        _mm256_loadu_si256((const __m256i *)(row_base + 6 * src_pitch));
+
+    const __m256i pair45_lo = _mm256_unpacklo_epi16(row4, row5);
+    const __m256i pair45_hi = _mm256_unpackhi_epi16(row4, row5);
+    const __m256i pair56_lo = _mm256_unpacklo_epi16(row5, row6);
+    const __m256i pair56_hi = _mm256_unpackhi_epi16(row5, row6);
+
+    tap_lo[0] = pair23_lo;
+    tap_lo[1] = pair45_lo;
+    tap_hi[0] = pair23_hi;
+    tap_hi[1] = pair45_hi;
+    const __m256i res0_lo = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(tap_lo, filter_coeffs), round_const),
+        FILTER_BITS);
+    const __m256i res0_hi = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(tap_hi, filter_coeffs), round_const),
+        FILTER_BITS);
+    store_16x1_pixels(res0_lo, res0_hi, clip_pixel, dst_ptr + y * dst_pitch);
+
+    tap_lo[0] = pair34_lo;
+    tap_lo[1] = pair56_lo;
+    tap_hi[0] = pair34_hi;
+    tap_hi[1] = pair56_hi;
+    const __m256i res1_lo = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(tap_lo, filter_coeffs), round_const),
+        FILTER_BITS);
+    const __m256i res1_hi = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(tap_hi, filter_coeffs), round_const),
+        FILTER_BITS);
+    store_16x1_pixels(res1_lo, res1_hi, clip_pixel,
+                      dst_ptr + (y + 1) * dst_pitch);
+
+    pair23_lo = pair45_lo;
+    pair23_hi = pair45_hi;
+    pair34_lo = pair56_lo;
+    pair34_hi = pair56_hi;
+    row4 = row6;
+  }
+
+  if (y < height) {
+    const __m256i row5 =
+        _mm256_loadu_si256((const __m256i *)(src_ptr + (y + 5) * src_pitch));
+    tap_lo[0] = pair23_lo;
+    tap_lo[1] = _mm256_unpacklo_epi16(row4, row5);
+    tap_hi[0] = pair23_hi;
+    tap_hi[1] = _mm256_unpackhi_epi16(row4, row5);
+    const __m256i res_lo = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(tap_lo, filter_coeffs), round_const),
+        FILTER_BITS);
+    const __m256i res_hi = _mm256_srai_epi32(
+        _mm256_add_epi32(convolve_4tap(tap_hi, filter_coeffs), round_const),
+        FILTER_BITS);
+    store_16x1_pixels(res_lo, res_hi, clip_pixel, dst_ptr + y * dst_pitch);
+  }
 }
 
 // -----------------------------------------------------------------------------
