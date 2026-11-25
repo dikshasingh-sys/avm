@@ -13,6 +13,7 @@
 #include <assert.h>
 #include <immintrin.h>  // AVX2
 
+#include "avm/avm_integer.h"
 #include "avm_ports/mem.h"
 #include "config/avm_dsp_rtcd.h"
 #include "avm_dsp/avm_filter.h"
@@ -626,6 +627,74 @@ void avm_highbd_calc8xNvar_avx2(const uint16_t *src, int src_stride,
   *sse = _mm_extract_epi32(v_d, 1);
 }
 
+static AVM_FORCE_INLINE __m256i highbd_diff_sse_4x16_avx2(
+    const uint16_t *src0, const uint16_t *ref0, const uint16_t *src1,
+    const uint16_t *ref1, const uint16_t *src2, const uint16_t *ref2,
+    const uint16_t *src3, const uint16_t *ref3, __m256i *v_sse) {
+  const __m256i diff0 =
+      _mm256_sub_epi16(_mm256_loadu_si256((const __m256i *)src0),
+                       _mm256_loadu_si256((const __m256i *)ref0));
+  const __m256i diff1 =
+      _mm256_sub_epi16(_mm256_loadu_si256((const __m256i *)src1),
+                       _mm256_loadu_si256((const __m256i *)ref1));
+  const __m256i diff2 =
+      _mm256_sub_epi16(_mm256_loadu_si256((const __m256i *)src2),
+                       _mm256_loadu_si256((const __m256i *)ref2));
+  const __m256i diff3 =
+      _mm256_sub_epi16(_mm256_loadu_si256((const __m256i *)src3),
+                       _mm256_loadu_si256((const __m256i *)ref3));
+
+  const __m256i sse01 = _mm256_add_epi32(_mm256_madd_epi16(diff0, diff0),
+                                         _mm256_madd_epi16(diff1, diff1));
+  const __m256i sse23 = _mm256_add_epi32(_mm256_madd_epi16(diff2, diff2),
+                                         _mm256_madd_epi16(diff3, diff3));
+  *v_sse = _mm256_add_epi32(*v_sse, _mm256_add_epi32(sse01, sse23));
+
+  return _mm256_add_epi16(_mm256_add_epi16(diff0, diff1),
+                          _mm256_add_epi16(diff2, diff3));
+}
+
+static AVM_FORCE_INLINE uint64_t highbd_reduce_sum32_sse32_avx2(
+    const __m256i v_sum, const __m256i v_sse, int64_t *sum) {
+  const __m256i v_interleaved_lo = _mm256_unpacklo_epi32(v_sum, v_sse);
+  const __m256i v_interleaved_hi = _mm256_unpackhi_epi32(v_sum, v_sse);
+  const __m256i v_sum_sse_256 =
+      _mm256_add_epi32(v_interleaved_lo, v_interleaved_hi);
+  __m128i v_sum_sse_128 =
+      _mm_add_epi32(_mm256_castsi256_si128(v_sum_sse_256),
+                    _mm256_extracti128_si256(v_sum_sse_256, 1));
+  v_sum_sse_128 =
+      _mm_add_epi32(v_sum_sse_128, _mm_srli_si128(v_sum_sse_128, 8));
+  *sum = (int64_t)_mm_cvtsi128_si32(v_sum_sse_128);
+  return (uint64_t)(uint32_t)_mm_extract_epi32(v_sum_sse_128, 1);
+}
+
+static AVM_FORCE_INLINE uint64_t highbd_reduce_sum32_sse64_avx2(
+    const __m256i v_sum, const __m256i v_sse, int64_t *sum) {
+  const __m256i v_zero = _mm256_setzero_si256();
+  const __m256i v_sse_64 =
+      _mm256_add_epi64(_mm256_unpacklo_epi32(v_sse, v_zero),
+                       _mm256_unpackhi_epi32(v_sse, v_zero));
+
+  __m128i v_sum_128 = _mm_add_epi32(_mm256_castsi256_si128(v_sum),
+                                    _mm256_extracti128_si256(v_sum, 1));
+  v_sum_128 = _mm_add_epi32(v_sum_128, _mm_srli_si128(v_sum_128, 8));
+  v_sum_128 = _mm_add_epi32(v_sum_128, _mm_srli_si128(v_sum_128, 4));
+
+  __m128i v_sse_128 = _mm_add_epi64(_mm256_castsi256_si128(v_sse_64),
+                                    _mm256_extracti128_si256(v_sse_64, 1));
+  v_sse_128 = _mm_add_epi64(v_sse_128, _mm_srli_si128(v_sse_128, 8));
+
+  *sum = (int64_t)_mm_cvtsi128_si32(v_sum_128);
+#if ARCH_X86_64
+  return (uint64_t)_mm_cvtsi128_si64(v_sse_128);
+#else
+  uint64_t sse;
+  xx_storel_64(&sse, v_sse_128);
+  return sse;
+#endif
+}
+
 // TODO(any): Rewrite this function to make it work for 12-bit input
 // Overflows for 12-bit inputs
 void avm_highbd_calc16xNvar_avx2(const uint16_t *src, int src_stride,
@@ -654,6 +723,131 @@ void avm_highbd_calc16xNvar_avx2(const uint16_t *src, int src_stride,
   v_d = _mm_add_epi32(v_d, _mm_srli_si128(v_d, 8));
   *sum = _mm_extract_epi32(v_d, 0);
   *sse = _mm_extract_epi32(v_d, 1);
+}
+
+static AVM_FORCE_INLINE uint64_t highbd_calc_var_16x4_avx2(const uint16_t *src,
+                                                           ptrdiff_t src_stride,
+                                                           const uint16_t *ref,
+                                                           ptrdiff_t ref_stride,
+                                                           int64_t *sum) {
+  const __m256i v_one = _mm256_set1_epi16(1);
+  __m256i v_sse_32 = _mm256_setzero_si256();
+  const uint16_t *const src_row2 = src + 2 * src_stride;
+  const uint16_t *const ref_row2 = ref + 2 * ref_stride;
+  const __m256i v_diff_sum4 = highbd_diff_sse_4x16_avx2(
+      src, ref, src + src_stride, ref + ref_stride, src_row2, ref_row2,
+      src_row2 + src_stride, ref_row2 + ref_stride, &v_sse_32);
+  return highbd_reduce_sum32_sse32_avx2(_mm256_madd_epi16(v_diff_sum4, v_one),
+                                        v_sse_32, sum);
+}
+
+static AVM_FORCE_INLINE uint64_t highbd_calc_var_16x8_avx2(const uint16_t *src,
+                                                           ptrdiff_t src_stride,
+                                                           const uint16_t *ref,
+                                                           ptrdiff_t ref_stride,
+                                                           int64_t *sum) {
+  const __m256i v_one = _mm256_set1_epi16(1);
+  __m256i v_sum_16 = _mm256_setzero_si256();
+  __m256i v_sse_32 = _mm256_setzero_si256();
+  for (int i = 0; i < 8; ++i) {
+    const __m256i v_diff =
+        _mm256_sub_epi16(_mm256_loadu_si256((const __m256i *)src),
+                         _mm256_loadu_si256((const __m256i *)ref));
+    v_sum_16 = _mm256_add_epi16(v_sum_16, v_diff);
+    v_sse_32 = _mm256_add_epi32(v_sse_32, _mm256_madd_epi16(v_diff, v_diff));
+    src += src_stride;
+    ref += ref_stride;
+  }
+  return highbd_reduce_sum32_sse32_avx2(_mm256_madd_epi16(v_sum_16, v_one),
+                                        v_sse_32, sum);
+}
+
+static AVM_NOINLINE uint64_t highbd_calc_var_16xh_avx2(
+    const uint16_t *src, ptrdiff_t src_stride, const uint16_t *ref,
+    ptrdiff_t ref_stride, int height, int64_t *sum) {
+  assert(height > 0 && height <= 32 && (height & 1) == 0);
+  const __m256i v_one = _mm256_set1_epi16(1);
+  __m256i v_sum_16 = _mm256_setzero_si256();
+  __m256i v_sse_32 = _mm256_setzero_si256();
+  do {
+    const __m256i diff0 =
+        _mm256_sub_epi16(_mm256_loadu_si256((const __m256i *)src),
+                         _mm256_loadu_si256((const __m256i *)ref));
+    const __m256i diff1 = _mm256_sub_epi16(
+        _mm256_loadu_si256((const __m256i *)(src + src_stride)),
+        _mm256_loadu_si256((const __m256i *)(ref + ref_stride)));
+    v_sum_16 = _mm256_add_epi16(v_sum_16, _mm256_add_epi16(diff0, diff1));
+    v_sse_32 = _mm256_add_epi32(
+        v_sse_32, _mm256_add_epi32(_mm256_madd_epi16(diff0, diff0),
+                                   _mm256_madd_epi16(diff1, diff1)));
+    src += 2 * src_stride;
+    ref += 2 * ref_stride;
+    height -= 2;
+  } while (height > 0);
+  return highbd_reduce_sum32_sse32_avx2(_mm256_madd_epi16(v_sum_16, v_one),
+                                        v_sse_32, sum);
+}
+
+static AVM_NOINLINE uint64_t highbd_calc_var_32xh_avx2(
+    const uint16_t *src, ptrdiff_t src_stride, const uint16_t *ref,
+    ptrdiff_t ref_stride, int height, int64_t *sum) {
+  assert(height > 0 && height <= 64 && (height & 1) == 0);
+  const __m256i v_one = _mm256_set1_epi16(1);
+  __m256i v_sum_32 = _mm256_setzero_si256();
+  __m256i v_sse_32 = _mm256_setzero_si256();
+  do {
+    const __m256i v_diff_sum4 = highbd_diff_sse_4x16_avx2(
+        src, ref, src + 16, ref + 16, src + src_stride, ref + ref_stride,
+        src + src_stride + 16, ref + ref_stride + 16, &v_sse_32);
+    v_sum_32 =
+        _mm256_add_epi32(v_sum_32, _mm256_madd_epi16(v_diff_sum4, v_one));
+    src += 2 * src_stride;
+    ref += 2 * ref_stride;
+    height -= 2;
+  } while (height > 0);
+  return highbd_reduce_sum32_sse32_avx2(v_sum_32, v_sse_32, sum);
+}
+
+static AVM_NOINLINE uint64_t highbd_calc_var_64xh_avx2(
+    const uint16_t *src, ptrdiff_t src_stride, const uint16_t *ref,
+    ptrdiff_t ref_stride, int height, int64_t *sum) {
+  assert(height > 0 && height <= 128);
+  const __m256i v_one = _mm256_set1_epi16(1);
+  __m256i v_sum_32 = _mm256_setzero_si256();
+  __m256i v_sse_32 = _mm256_setzero_si256();
+  do {
+    const __m256i v_row_sum =
+        highbd_diff_sse_4x16_avx2(src, ref, src + 16, ref + 16, src + 32,
+                                  ref + 32, src + 48, ref + 48, &v_sse_32);
+    v_sum_32 = _mm256_add_epi32(v_sum_32, _mm256_madd_epi16(v_row_sum, v_one));
+    src += src_stride;
+    ref += ref_stride;
+  } while (--height);
+  return highbd_reduce_sum32_sse64_avx2(v_sum_32, v_sse_32, sum);
+}
+
+static AVM_NOINLINE uint64_t highbd_calc_var_128xh_avx2(
+    const uint16_t *src, ptrdiff_t src_stride, const uint16_t *ref,
+    ptrdiff_t ref_stride, int height, int64_t *sum) {
+  assert(height > 0 && height <= 256);
+  const __m256i v_one = _mm256_set1_epi16(1);
+  __m256i v_sum_32 = _mm256_setzero_si256();
+  __m256i v_sse_32 = _mm256_setzero_si256();
+  do {
+    const __m256i v_sum_left64 =
+        highbd_diff_sse_4x16_avx2(src, ref, src + 16, ref + 16, src + 32,
+                                  ref + 32, src + 48, ref + 48, &v_sse_32);
+    v_sum_32 =
+        _mm256_add_epi32(v_sum_32, _mm256_madd_epi16(v_sum_left64, v_one));
+    const __m256i v_sum_right64 = highbd_diff_sse_4x16_avx2(
+        src + 64, ref + 64, src + 80, ref + 80, src + 96, ref + 96, src + 112,
+        ref + 112, &v_sse_32);
+    v_sum_32 =
+        _mm256_add_epi32(v_sum_32, _mm256_madd_epi16(v_sum_right64, v_one));
+    src += src_stride;
+    ref += ref_stride;
+  } while (--height);
+  return highbd_reduce_sum32_sse64_avx2(v_sum_32, v_sse_32, sum);
 }
 
 static AVM_INLINE void avm_highbd_calc4xNvar_avx2(const uint16_t *src,
@@ -740,6 +934,56 @@ static AVM_FORCE_INLINE void highbd_variance_avx2(
     const uint16_t *src, int src_stride, const uint16_t *ref, int ref_stride,
     int w, int h, uint64_t *sse, int64_t *sum, high_variance_fn_t var_fn,
     int block_size) {
+  if (block_size == 16) {
+    switch (w) {
+      case 16:
+        if (h == 4) {
+          *sse =
+              highbd_calc_var_16x4_avx2(src, src_stride, ref, ref_stride, sum);
+        } else if (h == 8) {
+          *sse =
+              highbd_calc_var_16x8_avx2(src, src_stride, ref, ref_stride, sum);
+        } else if (h <= 32) {
+          *sse = highbd_calc_var_16xh_avx2(src, src_stride, ref, ref_stride, h,
+                                           sum);
+        } else {
+          int64_t top_sum, bot_sum;
+          const uint64_t top_sse = highbd_calc_var_16xh_avx2(
+              src, src_stride, ref, ref_stride, 32, &top_sum);
+          const uint64_t bot_sse = highbd_calc_var_16xh_avx2(
+              src + 32 * (ptrdiff_t)src_stride, src_stride,
+              ref + 32 * (ptrdiff_t)ref_stride, ref_stride, h - 32, &bot_sum);
+          *sse = top_sse + bot_sse;
+          *sum = top_sum + bot_sum;
+        }
+        break;
+      case 32:
+        *sse =
+            highbd_calc_var_32xh_avx2(src, src_stride, ref, ref_stride, h, sum);
+        break;
+      case 64:
+        *sse =
+            highbd_calc_var_64xh_avx2(src, src_stride, ref, ref_stride, h, sum);
+        break;
+      case 128:
+        *sse = highbd_calc_var_128xh_avx2(src, src_stride, ref, ref_stride, h,
+                                          sum);
+        break;
+      default:
+        assert(w == 256);
+        {
+          int64_t left_sum, right_sum;
+          const uint64_t left_sse = highbd_calc_var_128xh_avx2(
+              src, src_stride, ref, ref_stride, h, &left_sum);
+          const uint64_t right_sse = highbd_calc_var_128xh_avx2(
+              src + 128, src_stride, ref + 128, ref_stride, h, &right_sum);
+          *sse = left_sse + right_sse;
+          *sum = left_sum + right_sum;
+        }
+        break;
+    }
+    return;
+  }
   int i, j;
   uint64_t sse_long = 0;
   int64_t sum_long = 0;
