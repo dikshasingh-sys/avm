@@ -17,6 +17,7 @@
 #include "config/avm_dsp_rtcd.h"
 #include "avm_dsp/avm_filter.h"
 #include "avm_dsp/x86/synonyms.h"
+#include "avm_dsp/x86/synonyms_avx2.h"
 
 typedef void (*high_variance_fn_t)(const uint16_t *src, int src_stride,
                                    const uint16_t *ref, int ref_stride,
@@ -920,100 +921,395 @@ VAR_FN_BD12(8, 64, 8, 9);
 #undef VAR_FN
 #undef VAR_FN_BD12
 
+static AVM_FORCE_INLINE __m256i load_4x4_16bit_avx2(const uint16_t *src,
+                                                    int stride) {
+  const __m128i row01 =
+      _mm_unpacklo_epi64(xx_loadl_64(src), xx_loadl_64(src + stride));
+  const __m128i row23 = _mm_unpacklo_epi64(xx_loadl_64(src + 2 * stride),
+                                           xx_loadl_64(src + 3 * stride));
+  return yy_set_m128i(row23, row01);
+}
+
+static AVM_FORCE_INLINE __m256i highbd_bil_filter_avx2(__m256i s0, __m256i s1,
+                                                       uint32_t offset,
+                                                       __m256i filter,
+                                                       __m256i round) {
+  if (offset == 4) return _mm256_avg_epu16(s0, s1);
+  const __m256i lo = _mm256_madd_epi16(_mm256_unpacklo_epi16(s0, s1), filter);
+  const __m256i hi = _mm256_madd_epi16(_mm256_unpackhi_epi16(s0, s1), filter);
+  return _mm256_packus_epi32(
+      _mm256_srli_epi32(_mm256_add_epi32(lo, round), FILTER_BITS),
+      _mm256_srli_epi32(_mm256_add_epi32(hi, round), FILTER_BITS));
+}
+
+static AVM_FORCE_INLINE __m128i highbd_bil_horiz_4x1_sse2(const uint16_t *src,
+                                                          uint32_t xoffset,
+                                                          __m128i fx,
+                                                          __m128i round) {
+  const __m128i s0 = xx_loadl_64(src);
+  if (xoffset == 0) return s0;
+  const __m128i s1 = xx_loadl_64(src + 1);
+  if (xoffset == 4) return _mm_avg_epu16(s0, s1);
+  const __m128i prod = _mm_madd_epi16(_mm_unpacklo_epi16(s0, s1), fx);
+  const __m128i res = _mm_srli_epi32(_mm_add_epi32(prod, round), FILTER_BITS);
+  return _mm_packus_epi32(res, res);
+}
+
+static AVM_FORCE_INLINE __m256i highbd_bil_horiz_4x4_avx2(const uint16_t *src,
+                                                          int stride,
+                                                          uint32_t xoffset,
+                                                          __m256i fx,
+                                                          __m256i round) {
+  const __m256i s0 = load_4x4_16bit_avx2(src, stride);
+  if (xoffset == 0) return s0;
+  const __m256i s1 = load_4x4_16bit_avx2(src + 1, stride);
+  return highbd_bil_filter_avx2(s0, s1, xoffset, fx, round);
+}
+
+static AVM_FORCE_INLINE __m256i highbd_bil_horiz_8x2_avx2(const uint16_t *src,
+                                                          int stride,
+                                                          uint32_t xoffset,
+                                                          __m256i fx,
+                                                          __m256i round) {
+  const __m256i s0 = yy_loadu2_128(src + stride, src);
+  if (xoffset == 0) return s0;
+  const __m256i s1 = yy_loadu2_128(src + stride + 1, src + 1);
+  return highbd_bil_filter_avx2(s0, s1, xoffset, fx, round);
+}
+
+static AVM_FORCE_INLINE __m256i highbd_bil_horiz_16x1_avx2(const uint16_t *src,
+                                                           uint32_t xoffset,
+                                                           __m256i fx,
+                                                           __m256i round) {
+  const __m256i s0 = yy_loadu_256(src);
+  if (xoffset == 0) return s0;
+  const __m256i s1 = yy_loadu_256(src + 1);
+  return highbd_bil_filter_avx2(s0, s1, xoffset, fx, round);
+}
+
+static AVM_FORCE_INLINE void highbd_var_acc_16x1_avx2(__m256i pred, __m256i ref,
+                                                      __m256i one,
+                                                      __m256i *v_sum,
+                                                      __m256i *v_sse) {
+  const __m256i diff = _mm256_sub_epi16(pred, ref);
+  *v_sum = _mm256_add_epi32(*v_sum, _mm256_madd_epi16(diff, one));
+  *v_sse = _mm256_add_epi32(*v_sse, _mm256_madd_epi16(diff, diff));
+}
+
+static AVM_FORCE_INLINE void highbd_sum_sse_avx2(__m256i v_sum, __m256i v_sse,
+                                                 int64_t *sum, uint64_t *sse) {
+  __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(v_sum),
+                                 _mm256_extracti128_si256(v_sum, 1));
+  sum128 = _mm_add_epi32(sum128, _mm_srli_si128(sum128, 8));
+  sum128 = _mm_add_epi32(sum128, _mm_srli_si128(sum128, 4));
+  *sum += _mm_cvtsi128_si32(sum128);
+
+  const __m256i sse64_lo = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(v_sse));
+  const __m256i sse64_hi =
+      _mm256_cvtepu32_epi64(_mm256_extracti128_si256(v_sse, 1));
+  const __m256i sse64 = _mm256_add_epi64(sse64_lo, sse64_hi);
+  __m128i sse128 = _mm_add_epi64(_mm256_castsi256_si128(sse64),
+                                 _mm256_extracti128_si256(sse64, 1));
+  sse128 = _mm_add_epi64(sse128, _mm_srli_si128(sse128, 8));
+  uint64_t sse_val;
+  xx_storel_64(&sse_val, sse128);
+  *sse += sse_val;
+}
+
+static AVM_FORCE_INLINE uint32_t highbd_calc_var(uint64_t sse_long,
+                                                 int64_t sum_long, int rshift,
+                                                 int bd, uint32_t *sse) {
+  if (bd == 10) {
+    *sse = (uint32_t)ROUND_POWER_OF_TWO(sse_long, 4);
+    sum_long = ROUND_POWER_OF_TWO(sum_long, 2);
+  } else if (bd == 12) {
+    *sse = (uint32_t)ROUND_POWER_OF_TWO(sse_long, 8);
+    sum_long = ROUND_POWER_OF_TWO(sum_long, 4);
+  } else {
+    *sse = (uint32_t)sse_long;
+  }
+  const int64_t var = (int64_t)(*sse) - ((sum_long * sum_long) >> rshift);
+  return (var >= 0) ? (uint32_t)var : 0;
+}
+
+static AVM_FORCE_INLINE void highbd_subpel_var_avx2(
+    const uint16_t *src, int src_stride, uint32_t xoffset, uint32_t yoffset,
+    const uint16_t *dst, int dst_stride, const uint16_t *second_pred, int w,
+    int h, uint64_t *sse, int64_t *sum) {
+  const __m256i fx =
+      _mm256_set1_epi32(((uint32_t)bilinear_filters_2t[xoffset][1] << 16) |
+                        bilinear_filters_2t[xoffset][0]);
+  const __m256i fy =
+      _mm256_set1_epi32(((uint32_t)bilinear_filters_2t[yoffset][1] << 16) |
+                        bilinear_filters_2t[yoffset][0]);
+  const __m256i round = _mm256_set1_epi32(1 << (FILTER_BITS - 1));
+  const __m256i one = _mm256_set1_epi16(1);
+  uint64_t sse_long = 0;
+  int64_t sum_long = 0;
+
+  if (w == 4) {
+    __m256i v_sum = _mm256_setzero_si256();
+    __m256i v_sse = _mm256_setzero_si256();
+    if (yoffset == 0) {
+      for (int y = 0; y < h; y += 4) {
+        __m256i pred = highbd_bil_horiz_4x4_avx2(
+            src + y * src_stride, src_stride, xoffset, fx, round);
+        if (second_pred != NULL) {
+          pred = _mm256_avg_epu16(pred, yy_loadu_256(second_pred + y * 4));
+        }
+        const __m256i ref =
+            load_4x4_16bit_avx2(dst + y * dst_stride, dst_stride);
+        highbd_var_acc_16x1_avx2(pred, ref, one, &v_sum, &v_sse);
+      }
+    } else {
+      __m128i prev_row =
+          highbd_bil_horiz_4x1_sse2(src, xoffset, _mm256_castsi256_si128(fx),
+                                    _mm256_castsi256_si128(round));
+      for (int y = 0; y < h; y += 4) {
+        const __m256i cur1234 = highbd_bil_horiz_4x4_avx2(
+            src + (y + 1) * src_stride, src_stride, xoffset, fx, round);
+        const __m128i cur12 = _mm256_castsi256_si128(cur1234);
+        const __m128i cur34 = _mm256_extracti128_si256(cur1234, 1);
+        const __m128i prev01 = _mm_unpacklo_epi64(prev_row, cur12);
+        const __m128i prev23 =
+            _mm_unpacklo_epi64(_mm_srli_si128(cur12, 8), cur34);
+        const __m256i prev0123 = yy_set_m128i(prev23, prev01);
+        __m256i pred =
+            highbd_bil_filter_avx2(prev0123, cur1234, yoffset, fy, round);
+        prev_row = _mm_srli_si128(cur34, 8);
+        if (second_pred != NULL) {
+          pred = _mm256_avg_epu16(pred, yy_loadu_256(second_pred + y * 4));
+        }
+        const __m256i ref =
+            load_4x4_16bit_avx2(dst + y * dst_stride, dst_stride);
+        highbd_var_acc_16x1_avx2(pred, ref, one, &v_sum, &v_sse);
+      }
+    }
+    highbd_sum_sse_avx2(v_sum, v_sse, &sum_long, &sse_long);
+  } else if (w == 8) {
+    __m256i v_sum = _mm256_setzero_si256();
+    __m256i v_sse = _mm256_setzero_si256();
+    if (yoffset == 0) {
+      for (int y = 0; y < h; y += 2) {
+        __m256i pred = highbd_bil_horiz_8x2_avx2(
+            src + y * src_stride, src_stride, xoffset, fx, round);
+        if (second_pred != NULL) {
+          pred = _mm256_avg_epu16(pred, yy_loadu_256(second_pred + y * 8));
+        }
+        const __m256i ref =
+            yy_loadu2_128(dst + (y + 1) * dst_stride, dst + y * dst_stride);
+        highbd_var_acc_16x1_avx2(pred, ref, one, &v_sum, &v_sse);
+      }
+    } else {
+      __m128i prev_row = _mm256_castsi256_si128(
+          highbd_bil_horiz_8x2_avx2(src, 0, xoffset, fx, round));
+      for (int y = 0; y < h; y += 2) {
+        const __m256i cur01 = highbd_bil_horiz_8x2_avx2(
+            src + (y + 1) * src_stride, src_stride, xoffset, fx, round);
+        const __m256i prev01 =
+            yy_set_m128i(_mm256_castsi256_si128(cur01), prev_row);
+        __m256i pred =
+            highbd_bil_filter_avx2(prev01, cur01, yoffset, fy, round);
+        prev_row = _mm256_extracti128_si256(cur01, 1);
+        if (second_pred != NULL) {
+          pred = _mm256_avg_epu16(pred, yy_loadu_256(second_pred + y * 8));
+        }
+        const __m256i ref =
+            yy_loadu2_128(dst + (y + 1) * dst_stride, dst + y * dst_stride);
+        highbd_var_acc_16x1_avx2(pred, ref, one, &v_sum, &v_sse);
+      }
+    }
+    highbd_sum_sse_avx2(v_sum, v_sse, &sum_long, &sse_long);
+  } else {
+    for (int col = 0; col < w; col += 16) {
+      if (yoffset == 0) {
+        for (int row = 0; row < h; row += 128) {
+          const int end_y = (h - row < 128) ? h : (row + 128);
+          __m256i v_sum = _mm256_setzero_si256();
+          __m256i v_sse = _mm256_setzero_si256();
+          for (int y = row; y < end_y; y += 2) {
+            __m256i pred0 = highbd_bil_horiz_16x1_avx2(
+                src + y * src_stride + col, xoffset, fx, round);
+            __m256i pred1 = highbd_bil_horiz_16x1_avx2(
+                src + (y + 1) * src_stride + col, xoffset, fx, round);
+            if (second_pred != NULL) {
+              pred0 = _mm256_avg_epu16(pred0,
+                                       yy_loadu_256(second_pred + y * w + col));
+              pred1 = _mm256_avg_epu16(
+                  pred1, yy_loadu_256(second_pred + (y + 1) * w + col));
+            }
+            highbd_var_acc_16x1_avx2(pred0,
+                                     yy_loadu_256(dst + y * dst_stride + col),
+                                     one, &v_sum, &v_sse);
+            highbd_var_acc_16x1_avx2(
+                pred1, yy_loadu_256(dst + (y + 1) * dst_stride + col), one,
+                &v_sum, &v_sse);
+          }
+          highbd_sum_sse_avx2(v_sum, v_sse, &sum_long, &sse_long);
+        }
+      } else {
+        __m256i prev_row =
+            highbd_bil_horiz_16x1_avx2(src + col, xoffset, fx, round);
+        for (int row = 0; row < h; row += 128) {
+          const int end_y = (h - row < 128) ? h : (row + 128);
+          __m256i v_sum = _mm256_setzero_si256();
+          __m256i v_sse = _mm256_setzero_si256();
+          for (int y = row; y < end_y; y += 2) {
+            const __m256i cur0 = highbd_bil_horiz_16x1_avx2(
+                src + (y + 1) * src_stride + col, xoffset, fx, round);
+            const __m256i cur1 = highbd_bil_horiz_16x1_avx2(
+                src + (y + 2) * src_stride + col, xoffset, fx, round);
+            __m256i pred0 =
+                highbd_bil_filter_avx2(prev_row, cur0, yoffset, fy, round);
+            __m256i pred1 =
+                highbd_bil_filter_avx2(cur0, cur1, yoffset, fy, round);
+            prev_row = cur1;
+            if (second_pred != NULL) {
+              pred0 = _mm256_avg_epu16(pred0,
+                                       yy_loadu_256(second_pred + y * w + col));
+              pred1 = _mm256_avg_epu16(
+                  pred1, yy_loadu_256(second_pred + (y + 1) * w + col));
+            }
+            highbd_var_acc_16x1_avx2(pred0,
+                                     yy_loadu_256(dst + y * dst_stride + col),
+                                     one, &v_sum, &v_sse);
+            highbd_var_acc_16x1_avx2(
+                pred1, yy_loadu_256(dst + (y + 1) * dst_stride + col), one,
+                &v_sum, &v_sse);
+          }
+          highbd_sum_sse_avx2(v_sum, v_sse, &sum_long, &sse_long);
+        }
+      }
+    }
+  }
+  *sse = sse_long;
+  *sum = sum_long;
+}
+
+static AVM_FORCE_INLINE void highbd_8_10_subpel_var_avx2(
+    const uint16_t *src, int src_stride, uint32_t xoffset, uint32_t yoffset,
+    const uint16_t *dst, int dst_stride, int w, int h, uint64_t *sse,
+    int64_t *sum) {
+  if (w >= 16) {
+    avm_highbd_var_filter_block2d_bil_avx2(src, src_stride, 1, h, w, xoffset,
+                                           yoffset, dst, dst_stride, sse, sum);
+  } else {
+    highbd_subpel_var_avx2(src, src_stride, xoffset, yoffset, dst, dst_stride,
+                           NULL, w, h, sse, sum);
+  }
+}
+
 // The 12-bit function is separated out because
-// avm_highbd_var_filter_block2d_bil_avx2 overflows when bsize \geq 16X16
-#define HIGHBD_SUBPIX_VAR_BD12(W, H, rshift)                                  \
-  uint32_t avm_highbd_12_sub_pixel_variance##W##x##H##_avx2(                  \
-      const uint16_t *src, int src_stride, int xoffset, int yoffset,          \
-      const uint16_t *dst, int dst_stride, uint32_t *sse) {                   \
-    uint64_t sse_long = 0;                                                    \
-    int64_t sum = 0;                                                          \
-                                                                              \
-    avm_highbd_var_filter_block2d_bil_avx2(src, src_stride, 1, H, W, xoffset, \
-                                           yoffset, dst, dst_stride,          \
-                                           &sse_long, &sum);                  \
-                                                                              \
-    *sse = (uint32_t)ROUND_POWER_OF_TWO(sse_long, 8);                         \
-    sum = ROUND_POWER_OF_TWO(sum, 4);                                         \
-                                                                              \
-    int32_t var = *sse - (uint32_t)((sum * sum) >> rshift);                   \
-                                                                              \
-    return (var > 0) ? var : 0;                                               \
+// avm_highbd_var_filter_block2d_bil_avx2 overflows when bsize >= 16x16.
+#define HIGHBD_SUBPIX_VAR_BD12(W, H, rshift)                               \
+  uint32_t avm_highbd_12_sub_pixel_variance##W##x##H##_avx2(               \
+      const uint16_t *src, int src_stride, int xoffset, int yoffset,       \
+      const uint16_t *dst, int dst_stride, uint32_t *sse) {                \
+    uint64_t sse_long = 0;                                                 \
+    int64_t sum = 0;                                                       \
+    highbd_subpel_var_avx2(src, src_stride, (uint32_t)xoffset,             \
+                           (uint32_t)yoffset, dst, dst_stride, NULL, W, H, \
+                           &sse_long, &sum);                               \
+    return highbd_calc_var(sse_long, sum, rshift, 12, sse);                \
   }
 
-#define HIGHBD_SUBPIX_VAR(W, H, rshift)                                       \
-  uint32_t avm_highbd_10_sub_pixel_variance##W##x##H##_avx2(                  \
-      const uint16_t *src, int src_stride, int xoffset, int yoffset,          \
-      const uint16_t *dst, int dst_stride, uint32_t *sse) {                   \
-    uint64_t sse_long = 0;                                                    \
-    int64_t sum = 0;                                                          \
-                                                                              \
-    avm_highbd_var_filter_block2d_bil_avx2(src, src_stride, 1, H, W, xoffset, \
-                                           yoffset, dst, dst_stride,          \
-                                           &sse_long, &sum);                  \
-                                                                              \
-    *sse = (uint32_t)ROUND_POWER_OF_TWO(sse_long, 4);                         \
-    sum = ROUND_POWER_OF_TWO(sum, 2);                                         \
-                                                                              \
-    int32_t var = *sse - (uint32_t)((sum * sum) >> rshift);                   \
-                                                                              \
-    return (var > 0) ? var : 0;                                               \
-  }                                                                           \
-  uint32_t avm_highbd_8_sub_pixel_variance##W##x##H##_avx2(                   \
-      const uint16_t *src, int src_stride, int xoffset, int yoffset,          \
-      const uint16_t *dst, int dst_stride, uint32_t *sse) {                   \
-    uint64_t sse_long = 0;                                                    \
-    int64_t sum = 0;                                                          \
-                                                                              \
-    avm_highbd_var_filter_block2d_bil_avx2(src, src_stride, 1, H, W, xoffset, \
-                                           yoffset, dst, dst_stride,          \
-                                           &sse_long, &sum);                  \
-                                                                              \
-    *sse = (uint32_t)sse_long;                                                \
-    int32_t var = *sse - (uint32_t)((sum * sum) >> rshift);                   \
-                                                                              \
-    return (var > 0) ? var : 0;                                               \
+#define HIGHBD_SUBPIX_VAR(W, H, rshift)                                   \
+  uint32_t avm_highbd_10_sub_pixel_variance##W##x##H##_avx2(              \
+      const uint16_t *src, int src_stride, int xoffset, int yoffset,      \
+      const uint16_t *dst, int dst_stride, uint32_t *sse) {               \
+    uint64_t sse_long = 0;                                                \
+    int64_t sum = 0;                                                      \
+    highbd_8_10_subpel_var_avx2(src, src_stride, (uint32_t)xoffset,       \
+                                (uint32_t)yoffset, dst, dst_stride, W, H, \
+                                &sse_long, &sum);                         \
+    return highbd_calc_var(sse_long, sum, rshift, 10, sse);               \
+  }                                                                       \
+  uint32_t avm_highbd_8_sub_pixel_variance##W##x##H##_avx2(               \
+      const uint16_t *src, int src_stride, int xoffset, int yoffset,      \
+      const uint16_t *dst, int dst_stride, uint32_t *sse) {               \
+    uint64_t sse_long = 0;                                                \
+    int64_t sum = 0;                                                      \
+    highbd_8_10_subpel_var_avx2(src, src_stride, (uint32_t)xoffset,       \
+                                (uint32_t)yoffset, dst, dst_stride, W, H, \
+                                &sse_long, &sum);                         \
+    return highbd_calc_var(sse_long, sum, rshift, 8, sse);                \
   }
 
-// HIGHBD_SUBPIX_VAR(256, 256, 16);
-HIGHBD_SUBPIX_VAR(256, 128, 15);
-HIGHBD_SUBPIX_VAR(128, 256, 15);
-HIGHBD_SUBPIX_VAR(128, 128, 14);
-HIGHBD_SUBPIX_VAR(128, 64, 13);
-HIGHBD_SUBPIX_VAR(64, 128, 13);
-HIGHBD_SUBPIX_VAR(64, 64, 12);
-HIGHBD_SUBPIX_VAR(64, 32, 11);
-HIGHBD_SUBPIX_VAR(32, 64, 11);
-HIGHBD_SUBPIX_VAR(32, 32, 10);
-HIGHBD_SUBPIX_VAR(32, 16, 9);
-HIGHBD_SUBPIX_VAR(16, 32, 9);
-HIGHBD_SUBPIX_VAR(16, 16, 8);
-HIGHBD_SUBPIX_VAR(16, 8, 7);
+#define HIGHBD_SUBPIX_AVG_VAR(W, H, rshift)                                    \
+  uint32_t avm_highbd_8_sub_pixel_avg_variance##W##x##H##_avx2(                \
+      const uint16_t *src, int src_stride, int xoffset, int yoffset,           \
+      const uint16_t *dst, int dst_stride, uint32_t *sse,                      \
+      const uint16_t *second_pred) {                                           \
+    uint64_t sse_long = 0;                                                     \
+    int64_t sum = 0;                                                           \
+    highbd_subpel_var_avx2(src, src_stride, (uint32_t)xoffset,                 \
+                           (uint32_t)yoffset, dst, dst_stride, second_pred, W, \
+                           H, &sse_long, &sum);                                \
+    return highbd_calc_var(sse_long, sum, rshift, 8, sse);                     \
+  }                                                                            \
+  uint32_t avm_highbd_10_sub_pixel_avg_variance##W##x##H##_avx2(               \
+      const uint16_t *src, int src_stride, int xoffset, int yoffset,           \
+      const uint16_t *dst, int dst_stride, uint32_t *sse,                      \
+      const uint16_t *second_pred) {                                           \
+    uint64_t sse_long = 0;                                                     \
+    int64_t sum = 0;                                                           \
+    highbd_subpel_var_avx2(src, src_stride, (uint32_t)xoffset,                 \
+                           (uint32_t)yoffset, dst, dst_stride, second_pred, W, \
+                           H, &sse_long, &sum);                                \
+    return highbd_calc_var(sse_long, sum, rshift, 10, sse);                    \
+  }                                                                            \
+  uint32_t avm_highbd_12_sub_pixel_avg_variance##W##x##H##_avx2(               \
+      const uint16_t *src, int src_stride, int xoffset, int yoffset,           \
+      const uint16_t *dst, int dst_stride, uint32_t *sse,                      \
+      const uint16_t *second_pred) {                                           \
+    uint64_t sse_long = 0;                                                     \
+    int64_t sum = 0;                                                           \
+    highbd_subpel_var_avx2(src, src_stride, (uint32_t)xoffset,                 \
+                           (uint32_t)yoffset, dst, dst_stride, second_pred, W, \
+                           H, &sse_long, &sum);                                \
+    return highbd_calc_var(sse_long, sum, rshift, 12, sse);                    \
+  }
 
-HIGHBD_SUBPIX_VAR(64, 16, 10);
-HIGHBD_SUBPIX_VAR(16, 64, 10);
-HIGHBD_SUBPIX_VAR(32, 8, 8);
-HIGHBD_SUBPIX_VAR(16, 4, 6);
+#define HIGHBD_SUBPIX_VARIANCES(W, H, rshift) \
+  HIGHBD_SUBPIX_VAR(W, H, rshift)             \
+  HIGHBD_SUBPIX_VAR_BD12(W, H, rshift)        \
+  HIGHBD_SUBPIX_AVG_VAR(W, H, rshift)
 
-// HIGHBD_SUBPIX_VAR_BD12(256, 256, 16);
-// HIGHBD_SUBPIX_VAR_BD12(256, 128, 15);
-// HIGHBD_SUBPIX_VAR_BD12(128, 256, 15);
-// HIGHBD_SUBPIX_VAR_BD12(128, 128, 14);
-// HIGHBD_SUBPIX_VAR_BD12(128, 64, 13);
-// HIGHBD_SUBPIX_VAR_BD12(64, 128, 13);
-// HIGHBD_SUBPIX_VAR_BD12(64, 64, 12);
-// HIGHBD_SUBPIX_VAR_BD12(64, 32, 11);
-// HIGHBD_SUBPIX_VAR_BD12(32, 64, 11);
-// HIGHBD_SUBPIX_VAR_BD12(32, 32, 10);
-// HIGHBD_SUBPIX_VAR_BD12(32, 16, 9);
-// HIGHBD_SUBPIX_VAR_BD12(16, 32, 9);
-// HIGHBD_SUBPIX_VAR_BD12(16, 16, 8);
-HIGHBD_SUBPIX_VAR_BD12(16, 8, 7);
+HIGHBD_SUBPIX_VARIANCES(256, 256, 16)
+HIGHBD_SUBPIX_VARIANCES(256, 128, 15)
+HIGHBD_SUBPIX_VARIANCES(128, 256, 15)
+HIGHBD_SUBPIX_VARIANCES(128, 128, 14)
+HIGHBD_SUBPIX_VARIANCES(128, 64, 13)
+HIGHBD_SUBPIX_VARIANCES(64, 128, 13)
+HIGHBD_SUBPIX_VARIANCES(64, 64, 12)
+HIGHBD_SUBPIX_VARIANCES(64, 32, 11)
+HIGHBD_SUBPIX_VARIANCES(32, 64, 11)
+HIGHBD_SUBPIX_VARIANCES(32, 32, 10)
+HIGHBD_SUBPIX_VARIANCES(32, 16, 9)
+HIGHBD_SUBPIX_VARIANCES(16, 32, 9)
+HIGHBD_SUBPIX_VARIANCES(16, 16, 8)
+HIGHBD_SUBPIX_VARIANCES(16, 8, 7)
+HIGHBD_SUBPIX_VARIANCES(8, 16, 7)
+HIGHBD_SUBPIX_VARIANCES(8, 8, 6)
+HIGHBD_SUBPIX_VARIANCES(8, 4, 5)
+HIGHBD_SUBPIX_VARIANCES(4, 8, 5)
+HIGHBD_SUBPIX_VARIANCES(4, 4, 4)
 
-// HIGHBD_SUBPIX_VAR_BD12(64, 16, 10);
-// HIGHBD_SUBPIX_VAR_BD12(16, 64, 10);
-// HIGHBD_SUBPIX_VAR_BD12(32, 8, 8);
-HIGHBD_SUBPIX_VAR_BD12(16, 4, 6);
+HIGHBD_SUBPIX_VARIANCES(64, 16, 10)
+HIGHBD_SUBPIX_VARIANCES(16, 64, 10)
+HIGHBD_SUBPIX_VARIANCES(32, 8, 8)
+HIGHBD_SUBPIX_VARIANCES(8, 32, 8)
+HIGHBD_SUBPIX_VARIANCES(16, 4, 6)
+HIGHBD_SUBPIX_VARIANCES(4, 16, 6)
+HIGHBD_SUBPIX_VARIANCES(64, 8, 9)
+HIGHBD_SUBPIX_VARIANCES(8, 64, 9)
+HIGHBD_SUBPIX_VARIANCES(32, 4, 7)
+HIGHBD_SUBPIX_VARIANCES(4, 32, 7)
+HIGHBD_SUBPIX_VARIANCES(64, 4, 8)
+HIGHBD_SUBPIX_VARIANCES(4, 64, 8)
+
+#undef HIGHBD_SUBPIX_VARIANCES
+#undef HIGHBD_SUBPIX_AVG_VAR
 #undef HIGHBD_SUBPIX_VAR
 #undef HIGHBD_SUBPIX_VAR_BD12
 

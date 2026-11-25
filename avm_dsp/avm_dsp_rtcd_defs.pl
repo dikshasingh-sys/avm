@@ -661,6 +661,8 @@ if (avm_config("CONFIG_AV2_ENCODER") eq "yes") {
           specialize "avm_highbd_${bd}_sub_pixel_avg_variance${w}x${h}", qw/sse2/;
         }
       }
+      specialize "avm_highbd_${bd}_sub_pixel_variance${w}x${h}", qw/avx2/;
+      specialize "avm_highbd_${bd}_sub_pixel_avg_variance${w}x${h}", qw/avx2/;
 
       add_proto qw/uint32_t/, "avm_highbd_${bd}_cwp_sub_pixel_avg_variance${w}x${h}", "const uint16_t *src_ptr, int source_stride, int xoffset, int  yoffset, const uint16_t *ref_ptr, int ref_stride, uint32_t *sse, const uint16_t *second_pred, const CWP_PARAMS* cwp_param";
     }
