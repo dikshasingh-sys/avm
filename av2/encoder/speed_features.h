@@ -1257,6 +1257,8 @@ typedef struct INTRA_MODE_SPEED_FEATURES {
   // only with reuse_uv_mode_rd_info.
   int reuse_uv_cfl_search;
 
+  bool prune_uv_intra_modes;
+
   // Use model RD cost of DIP modes to build top N model RD cost table for
   // better pruning. This logic is applied to mixed inter intra regions.
   // False: Do not use model RD cost of DIP modes

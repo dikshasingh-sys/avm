@@ -843,6 +843,7 @@ static void set_good_speed_features_framesize_independent(
     // sf->inter_sf.prune_comp_using_best_single_mode_ref = 2;
 
     sf->intra_sf.skip_intra_in_interframe = (cpi->oxcf.mode == GOOD) ? 4 : 2;
+    sf->intra_sf.prune_uv_intra_modes = (cpi->oxcf.mode == GOOD);
 
     sf->tpl_sf.prune_starting_mv = 2;
     sf->tpl_sf.subpel_force_stop = HALF_PEL;
@@ -1562,6 +1563,7 @@ static AVM_INLINE void init_intra_sf(INTRA_MODE_SPEED_FEATURES *intra_sf) {
   intra_sf->uv_search_luma_bound = false;
   intra_sf->uv_search_rd_bound_alpha16 = 0;
   intra_sf->reuse_uv_cfl_search = 0;
+  intra_sf->prune_uv_intra_modes = false;
   intra_sf->include_dip_for_top_n_model_rd_pruning = false;
   intra_sf->skip_intra_dip_search = false;
   intra_sf->intrabc_max_rd_cands = -1;

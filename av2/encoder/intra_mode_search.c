@@ -597,6 +597,74 @@ static AVM_INLINE void fetch_uv_mode_rd_info(ModeRDInfoUV *mode_rd_info_uv,
   tokenonly_rd_stats->rate = mode_rd_info_uv->rate_info[chroma_idx];
 }
 
+static uint32_t get_uv_intra_mode_keep_mask(
+    const AV2_COMP *const cpi, MACROBLOCK *x, BLOCK_SIZE bsize,
+    const IntraModeCfg *const intra_mode_cfg,
+    const ModeRDInfoUV *mode_rd_info_uv, int total_non_cfl) {
+  const AV2_COMMON *const cm = &cpi->common;
+  MACROBLOCKD *const xd = &x->e_mbd;
+  MB_MODE_INFO *const mbmi = xd->mi[0];
+  const struct macroblockd_plane *const pd_u = &xd->plane[AVM_PLANE_U];
+  const BLOCK_SIZE uv_bsize = get_mb_plane_block_size(
+      xd, mbmi, AVM_PLANE_U, pd_u->subsampling_x, pd_u->subsampling_y);
+  const TX_SIZE uv_tx_size =
+      av2_get_max_uv_txsize(bsize, pd_u->subsampling_x, pd_u->subsampling_y);
+  const int uv_max_bw = max_block_wide(xd, uv_bsize, AVM_PLANE_U);
+  const int uv_max_bh = max_block_high(xd, uv_bsize, AVM_PLANE_U);
+  const int cfl_or_mhccp =
+      is_cfl_allowed(cm->seq_params.enable_cfl_intra, xd) ||
+      is_mhccp_allowed(cm, xd);
+  int64_t best0 = INT64_MAX, best1 = INT64_MAX;
+  int idx0 = -1, idx1 = -1;
+  uint32_t keep_mask = 0;
+  for (int u = 0; u < total_non_cfl; ++u) {
+    const UV_PREDICTION_MODE um = mbmi->uv_intra_mode_list[u];
+    if ((!intra_mode_cfg->enable_smooth_intra && um >= UV_SMOOTH_PRED &&
+         um <= UV_SMOOTH_H_PRED) ||
+        (!intra_mode_cfg->enable_paeth_intra && um == UV_PAETH_PRED)) {
+      continue;
+    }
+    mbmi->cfl_idx = 0;
+    mbmi->uv_mode = um;
+    mbmi->uv_mode_idx = u;
+    mbmi->angle_delta[PLANE_TYPE_UV] =
+        (um == mbmi->mode) ? mbmi->angle_delta[PLANE_TYPE_Y] : 0;
+    if (um == UV_DC_PRED ||
+        (mode_rd_info_uv != NULL &&
+         mode_rd_info_uv
+             ->mode_evaluated[get_chroma_idx_for_reuse_uvrd(mbmi)])) {
+      keep_mask |= (1u << u);
+      continue;
+    }
+    for (int r = 0; r < uv_max_bh; r += tx_size_high_unit[uv_tx_size]) {
+      for (int c = 0; c < uv_max_bw; c += tx_size_wide_unit[uv_tx_size]) {
+        av2_predict_intra_block_facade(cm, xd, AVM_PLANE_U, c, r, uv_tx_size);
+        av2_predict_intra_block_facade(cm, xd, AVM_PLANE_V, c, r, uv_tx_size);
+      }
+    }
+    int m_rate = 0;
+    int64_t m_dist = 0;
+    model_rd_sb_fn[MODELRD_TYPE_INTRA](cpi, uv_bsize, x, xd, AVM_PLANE_U,
+                                       AVM_PLANE_V, &m_rate, &m_dist, NULL,
+                                       NULL, NULL, NULL, NULL);
+    const int m_cost =
+        get_uv_mode_cost(mbmi, &x->mode_costs, xd, cfl_or_mhccp, u);
+    const int64_t m_rd = RDCOST(x->rdmult, m_cost + m_rate, m_dist);
+    if (m_rd < best0) {
+      best1 = best0;
+      idx1 = idx0;
+      best0 = m_rd;
+      idx0 = u;
+    } else if (m_rd < best1) {
+      best1 = m_rd;
+      idx1 = u;
+    }
+  }
+  if (idx0 >= 0) keep_mask |= (1u << idx0);
+  if (idx1 >= 0) keep_mask |= (1u << idx1);
+  return keep_mask;
+}
+
 int64_t av2_rd_pick_intra_sbuv_mode(const AV2_COMP *const cpi, MACROBLOCK *x,
                                     int *rate, int *rate_tokenonly,
                                     int64_t *distortion, int *skippable,
@@ -677,6 +745,14 @@ int64_t av2_rd_pick_intra_sbuv_mode(const AV2_COMP *const cpi, MACROBLOCK *x,
           : 0;
   int64_t best_mhccp_rd = INT64_MAX;
   int best_mhccp_dir = -1;
+  const bool prune_uv_modes = cpi->sf.intra_sf.prune_uv_intra_modes &&
+                              !xd->lossless[mbmi->segment_id] &&
+                              !reuse_cached_uv;
+  const uint32_t keep_uv_mask =
+      prune_uv_modes ? get_uv_intra_mode_keep_mask(
+                           cpi, x, bsize, intra_mode_cfg, mode_rd_info_uv,
+                           UV_INTRA_MODES + implicit_cfl_mode_num - 5)
+                     : 0;
   for (int dpcm_uv_index = 0; dpcm_uv_index < dpcm_uv_loop_num;
        ++dpcm_uv_index) {
     mbmi->use_dpcm_uv = dpcm_uv_index;
@@ -724,6 +800,10 @@ int64_t av2_rd_pick_intra_sbuv_mode(const AV2_COMP *const cpi, MACROBLOCK *x,
         mbmi->uv_mode = UV_CFL_PRED;
         mbmi->uv_mode_idx = 0;
       } else {
+        if (prune_uv_modes && !is_reevaluation &&
+            !(keep_uv_mask & (1u << (mode_idx - 5)))) {
+          continue;
+        }
         mbmi->cfl_idx = 0;
         mbmi->uv_mode = mbmi->uv_intra_mode_list[mode_idx - 5];
         mbmi->uv_mode_idx = mode_idx - 5;
